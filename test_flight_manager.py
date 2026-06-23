@@ -11,14 +11,17 @@ from flight_manager import (
     HOUR_OPTIONS,
     MINUTE_OPTIONS,
     REFERENCE_OPTIONS_FILE,
+    apply_airline_code_prefixes,
     blank_record,
     filter_records,
     filter_options,
+    find_duplicate_flight_numbers,
     find_time_conflicts,
     load_data,
     load_reference_options,
     missing_fields,
     needs_pairing,
+    normalize_airline_code,
     normalize_time,
     paired_group,
     route_info_complete,
@@ -149,8 +152,9 @@ class FlightScheduleDataTests(unittest.TestCase):
             "country_or_region": "United States",
         }
         validate_record(record)
+        validate_record({**record, "outbound_flight_no": "9C101", "return_flight_no": "231001"})
         with self.assertRaises(ValueError):
-            validate_record({**record, "outbound_flight_no": "B100"})
+            validate_record({**record, "outbound_flight_no": "B!100"})
         with self.assertRaises(ValueError):
             validate_record({**record, "airport_code": "J1K"})
         with self.assertRaises(ValueError):
@@ -164,8 +168,37 @@ class FlightScheduleDataTests(unittest.TestCase):
         options = load_reference_options(REFERENCE_OPTIONS_FILE)
         countries = options["countries_or_regions"]
         self.assertEqual(len(countries), 195)
+        self.assertIn("airline_codes", options)
         for country in ("USA", "UK", "UAE", "France", "Holy See", "Palestine"):
             self.assertIn(country, countries)
+
+    def test_airline_code_normalization_and_prefixing(self) -> None:
+        self.assertEqual(normalize_airline_code("bf"), "BF")
+        self.assertEqual(normalize_airline_code("9c"), "9C")
+        self.assertEqual(normalize_airline_code("23"), "23")
+        with self.assertRaises(ValueError):
+            normalize_airline_code("B")
+        with self.assertRaises(ValueError):
+            normalize_airline_code("B!")
+
+        record = {**blank_record(), "airline": "French bee", "outbound_flight_no": "101", "return_flight_no": "BF102"}
+        apply_airline_code_prefixes(record, {"French bee": "BF"})
+        self.assertEqual(record["outbound_flight_no"], "BF101")
+        self.assertEqual(record["return_flight_no"], "BF102")
+        with self.assertRaises(ValueError):
+            apply_airline_code_prefixes({**record, "outbound_flight_no": "AF101"}, {"French bee": "BF"})
+
+    def test_duplicate_flight_number_detection(self) -> None:
+        existing = [
+            {**blank_record(), "id": "a", "outbound_flight_no": "BF101"},
+            {**blank_record(), "id": "b", "return_flight_no": "BF102"},
+        ]
+        self.assertEqual(find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF103"}), [])
+        duplicates = find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF101"})
+        self.assertEqual(duplicates[0]["flight_no"], "BF101")
+        self.assertEqual(find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF101"}, exclude_id="a"), [])
+        same_record = find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF200", "return_flight_no": "BF200"})
+        self.assertEqual(same_record[0]["field"], "same_record")
 
     def test_dropdown_filtering_prioritizes_prefix_then_contains(self) -> None:
         values = ["France", "South Africa", "Afghanistan", "Finland"]
