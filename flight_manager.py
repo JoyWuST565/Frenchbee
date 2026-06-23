@@ -510,6 +510,9 @@ class FlightEditor(Toplevel):
         self.entries: dict[str, Entry] = {}
         self.option_combos: dict[str, ttk.Combobox] = {}
         self.time_widgets: dict[str, tuple[ttk.Combobox, ttk.Combobox]] = {}
+        self.variables: dict[str, StringVar] = {}
+        self.time_variables: dict[str, tuple[StringVar, StringVar]] = {}
+        self.field_widgets: dict[str, object] = {}
         self.readonly_fields: set[str] = set()
         self.supplement_mode = bool(self.original_id and missing_fields(self.record))
         self.title("编辑航线" if record else "新增航线")
@@ -547,9 +550,11 @@ class FlightEditor(Toplevel):
                 self.create_option_selector(body, row, field)
             else:
                 variable = StringVar(value=self.record.get(field, ""))
+                self.variables[field] = variable
                 entry = ttk.Entry(body, textvariable=variable, width=30)
                 entry.grid(row=row, column=1, sticky="we", pady=5)
                 self.entries[field] = entry
+                self.field_widgets[field] = entry
 
         button_bar = ttk.Frame(body)
         button_bar.grid(row=len(REQUIRED_FIELDS) + 1 + row_offset, column=0, columnspan=3, sticky="e", pady=(14, 0))
@@ -559,8 +564,14 @@ class FlightEditor(Toplevel):
         ttk.Button(button_bar, text="取消", command=self.destroy).pack(side=LEFT)
 
         target_field = focus_field or (missing_fields(self.record)[0] if missing_fields(self.record) else "outbound_flight_no")
-        if self.entries:
-            self.after(100, lambda: self.entries.get(target_field, next(iter(self.entries.values()))).focus_set())
+        if self.field_widgets:
+            self.after(100, lambda: self.focus_editor_field(target_field))
+
+    def focus_editor_field(self, field: str) -> None:
+        widget = self.field_widgets.get(field)
+        if widget is None:
+            widget = next(iter(self.field_widgets.values()))
+        widget.focus_set()
 
     def create_time_selector(self, parent: ttk.Frame, row: int, field: str) -> None:
         frame = ttk.Frame(parent)
@@ -569,9 +580,12 @@ class FlightEditor(Toplevel):
         hour_value, minute_value = ("", "")
         if value and TIME_RE.fullmatch(value):
             hour_value, minute_value = value.split(":")
-        hour_combo = ttk.Combobox(frame, width=5, values=HOUR_OPTIONS, textvariable=StringVar(value=hour_value))
+        hour_var = StringVar(value=hour_value)
+        minute_var = StringVar(value=minute_value)
+        self.time_variables[field] = (hour_var, minute_var)
+        hour_combo = ttk.Combobox(frame, width=5, values=HOUR_OPTIONS, textvariable=hour_var)
         minute_values = MINUTE_OPTIONS if not minute_value or minute_value in MINUTE_OPTIONS else sorted({*MINUTE_OPTIONS, minute_value})
-        minute_combo = ttk.Combobox(frame, width=5, values=minute_values, textvariable=StringVar(value=minute_value))
+        minute_combo = ttk.Combobox(frame, width=5, values=minute_values, textvariable=minute_var)
         hour_combo.pack(side=LEFT)
         ttk.Label(frame, text="时").pack(side=LEFT, padx=(4, 8))
         minute_combo.pack(side=LEFT)
@@ -579,11 +593,13 @@ class FlightEditor(Toplevel):
         hour_combo.bind("<KeyRelease>", lambda _event, combo=hour_combo: self.filter_static_combo(combo, HOUR_OPTIONS))
         minute_combo.bind("<KeyRelease>", lambda _event, combo=minute_combo: self.filter_static_combo(combo, MINUTE_OPTIONS))
         self.time_widgets[field] = (hour_combo, minute_combo)
+        self.field_widgets[field] = hour_combo
         ttk.Label(parent, text="每 5 分钟", foreground="#6B7280").grid(row=row, column=2, sticky="w", padx=(8, 0))
 
     def create_option_selector(self, parent: ttk.Frame, row: int, field: str) -> None:
         config = OPTION_FIELDS[field]
         variable = StringVar(value=self.record.get(field, ""))
+        self.variables[field] = variable
         combo = ttk.Combobox(
             parent,
             textvariable=variable,
@@ -596,6 +612,7 @@ class FlightEditor(Toplevel):
         combo.bind("<KeyRelease>", lambda _event, item=field: self.filter_option_combo(item))
         combo.bind("<Button-1>", lambda _event, item=field: self.filter_option_combo(item))
         self.option_combos[field] = combo
+        self.field_widgets[field] = combo
         ttk.Button(parent, text="管理", command=lambda item=field: self.open_option_manager(item)).grid(row=row, column=2, sticky="w", padx=(8, 0))
 
     def filter_static_combo(self, combo: ttk.Combobox, values: list[str]) -> None:
