@@ -18,6 +18,9 @@ from flight_manager import (
     paired_group,
     route_info_complete,
     save_data,
+    strong_pair_candidates,
+    sync_blank_pair_fields,
+    validate_record,
 )
 
 
@@ -120,10 +123,88 @@ class FlightScheduleDataTests(unittest.TestCase):
         self.assertEqual(paired_group(paired, paired[2]), [])
 
     def test_time_normalization(self) -> None:
+        self.assertEqual(normalize_time("0815"), "08:15")
         self.assertEqual(normalize_time("6:30:00"), "06:30")
         self.assertEqual(normalize_time("06:30"), "06:30")
         with self.assertRaises(ValueError):
             normalize_time("24:00")
+        with self.assertRaises(ValueError):
+            normalize_time("08A5")
+
+    def test_flight_number_airport_and_length_validation(self) -> None:
+        record = {
+            **blank_record(),
+            "outbound_flight_no": "bf1",
+            "return_flight_no": "BF1001",
+            "airport_code": "jfk",
+            "departure_time": "0815",
+            "arrival_time": "19:30",
+            "aircraft_type": "A350",
+            "airline": "French bee",
+            "country_or_region": "United States",
+        }
+        validate_record(record)
+        with self.assertRaises(ValueError):
+            validate_record({**record, "outbound_flight_no": "B100"})
+        with self.assertRaises(ValueError):
+            validate_record({**record, "airport_code": "J1K"})
+        with self.assertRaises(ValueError):
+            validate_record({**record, "aircraft_type": "A" * 51})
+
+    def test_strong_pair_candidate_uses_same_airport_and_complementary_time(self) -> None:
+        original = {
+            **blank_record(),
+            "id": "source",
+            "airport_code": "JFK",
+            "departure_time": "08:00",
+        }
+        completed = {
+            **original,
+            "outbound_flight_no": "BF100",
+            "return_flight_no": "BF101",
+            "arrival_time": "20:00",
+            "aircraft_type": "A350",
+            "airline": "French bee",
+            "country_or_region": "United States",
+        }
+        candidate = {
+            **blank_record(),
+            "id": "candidate",
+            "airport_code": "JFK",
+            "arrival_time": "20:00",
+        }
+        wrong_airport = {
+            **blank_record(),
+            "id": "wrong",
+            "airport_code": "LAX",
+            "arrival_time": "20:00",
+        }
+        result = strong_pair_candidates([completed, candidate, wrong_airport], completed, original)
+        self.assertEqual([record["id"] for record in result], ["candidate"])
+
+    def test_pair_sync_fills_blank_fields_without_overwriting_existing_values(self) -> None:
+        source = {
+            **blank_record(),
+            "outbound_flight_no": "BF100",
+            "return_flight_no": "BF101",
+            "airport_code": "JFK",
+            "departure_time": "08:00",
+            "arrival_time": "20:00",
+            "aircraft_type": "A350",
+            "airline": "French bee",
+            "country_or_region": "United States",
+        }
+        target = {
+            **blank_record(),
+            "airport_code": "JFK",
+            "arrival_time": "20:00",
+            "aircraft_type": "Existing type",
+        }
+        sync_blank_pair_fields(source, target)
+        self.assertEqual(target["outbound_flight_no"], "BF100")
+        self.assertEqual(target["return_flight_no"], "BF101")
+        self.assertEqual(target["departure_time"], "08:00")
+        self.assertEqual(target["aircraft_type"], "Existing type")
 
     def test_save_and_reload_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

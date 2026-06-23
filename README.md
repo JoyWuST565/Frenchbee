@@ -21,10 +21,13 @@ The app only reads and writes `flight_schedule.json` locally.
 
 - Add, edit, delete, and precisely search route records.
 - New records must include every required field before they can be saved.
+- Flight numbers must use two letters plus 1-4 digits, and airport codes must use three letters.
+- Times can be entered as `HH:MM` or four digits such as `0815`, which is saved as `08:15`.
 - Warn when departure or arrival times are already occupied.
 - Mark records with missing required fields for later completion.
-- Manually associate outbound and return flight records after legacy records are completed.
+- Manually associate outbound and return flight records after legacy records are completed, using same-airport existing records as candidates.
 - Automatically assigns an association ID when a newly added route has complete outbound and return information.
+- When a legacy single-direction record is completed, the app tries to pair it with an existing same-airport complementary record and fills blank fields on the counterpart.
 - When searching for one flight, associated outbound or return records are shown together.
 - Deletions are only allowed for an associated outbound/return group, and the app deletes the group together.
 - When editing an associated record, the app provides a direct button to open the corresponding flight record.

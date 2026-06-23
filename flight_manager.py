@@ -44,7 +44,10 @@ DATA_FIELDS = (
 )
 
 TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-AIRPORT_RE = re.compile(r"^[A-Z0-9]{3}$")
+SIMPLE_TIME_RE = re.compile(r"^\d{4}$")
+FLIGHT_NO_RE = re.compile(r"^[A-Z]{2}\d{1,4}$")
+AIRPORT_RE = re.compile(r"^[A-Z]{3}$")
+MAX_SHORT_TEXT_LENGTH = 50
 
 
 def now_iso() -> str:
@@ -76,9 +79,15 @@ def normalize_time(value: str) -> str:
     value = (value or "").strip()
     if not value:
         return ""
+    if SIMPLE_TIME_RE.fullmatch(value):
+        hour = int(value[:2])
+        minute = int(value[2:])
+        if hour > 23 or minute > 59:
+            raise ValueError("简易时间必须为 0000 到 2359 之间的四位数字。")
+        return f"{hour:02d}:{minute:02d}"
     match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", value)
     if not match:
-        raise ValueError("时间格式应为 HH:MM，例如 08:30。")
+        raise ValueError("时间格式应为 HH:MM 或四位数字，例如 08:30 或 0815。")
     hour = int(match.group(1))
     minute = int(match.group(2))
     if hour > 23 or minute > 59:
@@ -130,9 +139,16 @@ def pair_display(record: dict[str, str]) -> str:
 
 
 def validate_record(record: dict[str, str]) -> None:
+    for field in ("outbound_flight_no", "return_flight_no"):
+        flight_no = record.get(field, "").strip().upper()
+        if flight_no and not FLIGHT_NO_RE.fullmatch(flight_no):
+            raise ValueError(f"{FIELD_LABELS[field]}应由两位英文字母和 1 至 4 位数字组成，例如 BF1、BF101、BF1001。")
     airport_code = record.get("airport_code", "").strip().upper()
     if airport_code and not AIRPORT_RE.fullmatch(airport_code):
-        raise ValueError("机场代码应为 3 位大写字母或数字。")
+        raise ValueError("机场代码应为三个英文字母，例如 RUN、JFK。")
+    for field in ("aircraft_type", "airline"):
+        if len(record.get(field, "")) > MAX_SHORT_TEXT_LENGTH:
+            raise ValueError(f"{FIELD_LABELS[field]}长度不能超过 {MAX_SHORT_TEXT_LENGTH} 个字符。")
     normalize_time(record.get("departure_time", ""))
     normalize_time(record.get("arrival_time", ""))
 
@@ -192,6 +208,42 @@ def paired_group(records: list[dict[str, str]], record: dict[str, str]) -> list[
     return [item for item in records if item.get("route_pair_id") == pair_id]
 
 
+def same_airport_candidates(records: list[dict[str, str]], source: dict[str, str]) -> list[dict[str, str]]:
+    airport_code = source.get("airport_code", "")
+    if not airport_code:
+        return []
+    return [
+        record
+        for record in records
+        if record.get("id") != source.get("id") and record.get("airport_code") == airport_code
+    ]
+
+
+def strong_pair_candidates(records: list[dict[str, str]], source: dict[str, str], original: dict[str, str] | None = None) -> list[dict[str, str]]:
+    candidates = same_airport_candidates(records, source)
+    original = original or source
+    had_departure_only = bool(original.get("departure_time")) and not original.get("arrival_time")
+    had_arrival_only = bool(original.get("arrival_time")) and not original.get("departure_time")
+    if had_departure_only and source.get("arrival_time"):
+        return [record for record in candidates if not record.get("route_pair_id") and record.get("arrival_time") == source.get("arrival_time")]
+    if had_arrival_only and source.get("departure_time"):
+        return [record for record in candidates if not record.get("route_pair_id") and record.get("departure_time") == source.get("departure_time")]
+    return []
+
+
+def sync_blank_pair_fields(left: dict[str, str], right: dict[str, str]) -> None:
+    for field in REQUIRED_FIELDS:
+        left_value = str(left.get(field, "")).strip()
+        right_value = str(right.get(field, "")).strip()
+        if left_value and not right_value:
+            right[field] = left_value
+        elif right_value and not left_value:
+            left[field] = right_value
+    timestamp = now_iso()
+    left["updated_at"] = timestamp
+    right["updated_at"] = timestamp
+
+
 def find_time_conflicts(records: list[dict[str, str]], candidate: dict[str, str], exclude_id: str | None = None) -> list[dict[str, str]]:
     conflicts: list[dict[str, str]] = []
     departure_time = candidate.get("departure_time", "")
@@ -245,6 +297,8 @@ class FlightEditor(Toplevel):
         self.original_id = record.get("id") if record else None
         self.record = copy.deepcopy(record) if record else blank_record()
         self.entries: dict[str, Entry] = {}
+        self.readonly_fields: set[str] = set()
+        self.supplement_mode = bool(self.original_id and missing_fields(self.record))
         self.title("编辑航线" if record else "新增航线")
         self.resizable(False, False)
         self.transient(app.root)
@@ -270,12 +324,23 @@ class FlightEditor(Toplevel):
                 label_text = f"● {label_text}"
             label = ttk.Label(body, text=label_text, foreground="#B91C1C" if field in missing_fields(self.record) else "#111827")
             label.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=5)
-            variable = StringVar(value=self.record.get(field, ""))
-            entry = ttk.Entry(body, textvariable=variable, width=30)
-            entry.grid(row=row, column=1, sticky="we", pady=5)
-            self.entries[field] = entry
+            if self.supplement_mode and self.record.get(field, ""):
+                self.readonly_fields.add(field)
+                value_label = ttk.Label(body, text=self.record.get(field, ""), width=30, anchor="w", relief="sunken", padding=(4, 2))
+                value_label.grid(row=row, column=1, sticky="we", pady=5)
+            else:
+                variable = StringVar(value=self.record.get(field, ""))
+                entry_options = {"textvariable": variable, "width": 30}
+                if field in {"aircraft_type", "airline"}:
+                    entry_options.update({
+                        "validate": "key",
+                        "validatecommand": (self.register(self.limit_short_text), "%P"),
+                    })
+                entry = ttk.Entry(body, **entry_options)
+                entry.grid(row=row, column=1, sticky="we", pady=5)
+                self.entries[field] = entry
             if field in {"departure_time", "arrival_time"}:
-                ttk.Label(body, text="HH:MM", foreground="#6B7280").grid(row=row, column=2, sticky="w", padx=(8, 0))
+                ttk.Label(body, text="HH:MM 或 0815", foreground="#6B7280").grid(row=row, column=2, sticky="w", padx=(8, 0))
 
         button_bar = ttk.Frame(body)
         button_bar.grid(row=len(REQUIRED_FIELDS) + 1 + row_offset, column=0, columnspan=3, sticky="e", pady=(14, 0))
@@ -285,7 +350,11 @@ class FlightEditor(Toplevel):
         ttk.Button(button_bar, text="取消", command=self.destroy).pack(side=LEFT)
 
         target_field = focus_field or (missing_fields(self.record)[0] if missing_fields(self.record) else "outbound_flight_no")
-        self.after(100, lambda: self.entries.get(target_field, next(iter(self.entries.values()))).focus_set())
+        if self.entries:
+            self.after(100, lambda: self.entries.get(target_field, next(iter(self.entries.values()))).focus_set())
+
+    def limit_short_text(self, value: str) -> bool:
+        return len(value) <= MAX_SHORT_TEXT_LENGTH
 
     def collect_record(self) -> dict[str, str]:
         record = copy.deepcopy(self.record)
@@ -341,7 +410,12 @@ class FlightEditor(Toplevel):
         else:
             self.app.records.append(record)
 
+        original_snapshot = copy.deepcopy(self.record)
         self.app.persist_and_refresh(select_id=record["id"])
+        if self.original_id and route_info_complete(record) and not record.get("route_pair_id"):
+            self.destroy()
+            self.app.root.after(50, lambda: self.app.try_auto_pair_existing(record["id"], original_snapshot))
+            return
         show_counterpart_prompt = bool(self.original_id and self.app.get_counterparts(record))
         if missing_fields(record):
             messagebox.showwarning("待补录提醒", "该航线仍有字段未录入，已在提醒区标记。", parent=self)
@@ -353,10 +427,12 @@ class FlightEditor(Toplevel):
 
 
 class PairDialog(Toplevel):
-    def __init__(self, app: "FlightManagerApp", source: dict[str, str]):
+    def __init__(self, app: "FlightManagerApp", source: dict[str, str], notice: str = "", same_airport_only: bool = True):
         super().__init__(app.root)
         self.app = app
         self.source = source
+        self.notice = notice
+        self.same_airport_only = same_airport_only
         self.filter_text = StringVar()
         self.title("关联去程/回程航班")
         self.geometry("850x500")
@@ -368,6 +444,8 @@ class PairDialog(Toplevel):
 
         ttk.Label(body, text="当前航线").pack(anchor="w")
         ttk.Label(body, text=record_summary(source), foreground="#111827").pack(anchor="w", pady=(0, 10))
+        if notice:
+            ttk.Label(body, text=notice, foreground="#C2410C", wraplength=780).pack(anchor="w", pady=(0, 10))
 
         search_bar = ttk.Frame(body)
         search_bar.pack(fill=X, pady=(0, 8))
@@ -405,6 +483,8 @@ class PairDialog(Toplevel):
         self.candidates.delete(*self.candidates.get_children())
         for record in self.app.records:
             if record.get("id") == self.source.get("id"):
+                continue
+            if self.same_airport_only and record.get("airport_code") != self.source.get("airport_code"):
                 continue
             summary = record_summary(record)
             searchable = " ".join(
@@ -650,7 +730,26 @@ class FlightManagerApp:
             messagebox.showwarning("请先补录", "该航线仍有必填信息未录入，请补录完整后再关联去程或回程航班。", parent=self.root)
             FlightEditor(self, record, focus_field=missing_fields(record)[0])
             return
-        PairDialog(self, record)
+        PairDialog(self, record, notice="请从机场代码相同的现有航班中选择对应的去程或回程航班。")
+
+    def try_auto_pair_existing(self, record_id: str, original_record: dict[str, str]) -> None:
+        record = next((item for item in self.records if item.get("id") == record_id), None)
+        if not record or record.get("route_pair_id") or not route_info_complete(record):
+            return
+        candidates = strong_pair_candidates(self.records, record, original_record)
+        if len(candidates) == 1:
+            self.associate_records(record_id, candidates[0]["id"], show_message=False)
+            messagebox.showinfo(
+                "已自动关联",
+                "已根据机场代码和补录的对应起降时间，将该航班与现有单程记录关联，并同步补齐对方空白字段。",
+                parent=self.root,
+            )
+            return
+        if len(candidates) > 1:
+            notice = "找到多个同机场、同对应时间的候选航班，请手动选择要关联的去程或回程航班。"
+        else:
+            notice = "未找到唯一的自动匹配项。请从机场代码相同的现有航班中手动选择对应的去程或回程航班。"
+        PairDialog(self, record, notice=notice)
 
     def get_counterparts(self, record: dict[str, str]) -> list[dict[str, str]]:
         return [item for item in paired_group(self.records, record) if item.get("id") != record.get("id")]
@@ -686,11 +785,14 @@ class FlightManagerApp:
         ttk.Button(button_bar, text="编辑对应航班", command=lambda: (prompt.destroy(), self.open_counterpart_editor(record_id))).pack(side=LEFT)
         ttk.Button(button_bar, text="稍后处理", command=prompt.destroy).pack(side=RIGHT)
 
-    def associate_records(self, source_id: str, target_id: str, parent=None) -> bool:
+    def associate_records(self, source_id: str, target_id: str, parent=None, show_message: bool = True) -> bool:
         source = next((item for item in self.records if item.get("id") == source_id), None)
         target = next((item for item in self.records if item.get("id") == target_id), None)
         if not source or not target:
             messagebox.showerror("关联失败", "未找到需要关联的航线记录。", parent=parent or self.root)
+            return False
+        if source.get("airport_code") != target.get("airport_code"):
+            messagebox.showerror("关联失败", "仅允许关联机场代码相同的去程/回程航班。", parent=parent or self.root)
             return False
         source_pair = source.get("route_pair_id", "")
         target_pair = target.get("route_pair_id", "")
@@ -712,8 +814,10 @@ class FlightManagerApp:
         for record in (source, target):
             record["route_pair_id"] = pair_id
             record["updated_at"] = now_iso()
+        sync_blank_pair_fields(source, target)
         self.persist_and_refresh(select_id=source_id)
-        messagebox.showinfo("关联完成", "已关联所选去程/回程航班。检索其中任一航班时，对应航班也会一起显示。", parent=parent or self.root)
+        if show_message:
+            messagebox.showinfo("关联完成", "已关联所选去程/回程航班，并同步补齐对方空白字段。检索其中任一航班时，对应航班也会一起显示。", parent=parent or self.root)
         return True
 
     def clear_selected_pair(self) -> None:
