@@ -14,6 +14,7 @@ from tkinter import ttk
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_FILE = APP_DIR / "flight_schedule.json"
+REFERENCE_OPTIONS_FILE = APP_DIR / "reference_options.json"
 SCHEMA_VERSION = 1
 
 FIELD_LABELS = {
@@ -47,7 +48,29 @@ TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 SIMPLE_TIME_RE = re.compile(r"^\d{4}$")
 FLIGHT_NO_RE = re.compile(r"^[A-Z]{2}\d{1,4}$")
 AIRPORT_RE = re.compile(r"^[A-Z]{3}$")
-MAX_SHORT_TEXT_LENGTH = 50
+OPTION_FIELDS = {
+    "aircraft_type": {
+        "category": "aircraft_types",
+        "label": "机型",
+        "max_length": 25,
+        "allow_rename": False,
+    },
+    "airline": {
+        "category": "airlines",
+        "label": "航司",
+        "max_length": 25,
+        "allow_rename": False,
+    },
+    "country_or_region": {
+        "category": "countries_or_regions",
+        "label": "国家/地区",
+        "max_length": 50,
+        "allow_rename": True,
+    },
+}
+OPTION_CATEGORIES = {config["category"]: field for field, config in OPTION_FIELDS.items()}
+HOUR_OPTIONS = [f"{hour:02d}" for hour in range(24)]
+MINUTE_OPTIONS = [f"{minute:02d}" for minute in range(0, 60, 5)]
 
 
 def now_iso() -> str:
@@ -73,6 +96,60 @@ def blank_record() -> dict[str, str]:
 
 def new_pair_id() -> str:
     return f"pair-{uuid.uuid4().hex[:12]}"
+
+
+def normalize_options(values: list[str], max_length: int) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        if not item or len(item) > max_length:
+            continue
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    return sorted(normalized, key=str.casefold)
+
+
+def load_reference_options(path: Path = REFERENCE_OPTIONS_FILE) -> dict[str, list[str]]:
+    if path.exists():
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    else:
+        data = {}
+    return {
+        config["category"]: normalize_options(data.get(config["category"], []), config["max_length"])
+        for config in OPTION_FIELDS.values()
+    }
+
+
+def save_reference_options(options: dict[str, list[str]], path: Path = REFERENCE_OPTIONS_FILE) -> None:
+    payload = {
+        config["category"]: normalize_options(options.get(config["category"], []), config["max_length"])
+        for config in OPTION_FIELDS.values()
+    }
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False, prefix=".reference_options.", suffix=".tmp") as handle:
+            temp_name = handle.name
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_name, path)
+    except Exception:
+        if temp_name and os.path.exists(temp_name):
+            os.remove(temp_name)
+        raise
+
+
+def filter_options(values: list[str], term: str, limit: int = 80) -> list[str]:
+    term = term.strip().casefold()
+    if not term:
+        return values[:limit]
+    starts = [value for value in values if value.casefold().startswith(term)]
+    contains = [value for value in values if term in value.casefold() and value not in starts]
+    return (starts + contains)[:limit]
 
 
 def normalize_time(value: str) -> str:
@@ -146,9 +223,9 @@ def validate_record(record: dict[str, str]) -> None:
     airport_code = record.get("airport_code", "").strip().upper()
     if airport_code and not AIRPORT_RE.fullmatch(airport_code):
         raise ValueError("机场代码应为三个英文字母，例如 RUN、JFK。")
-    for field in ("aircraft_type", "airline"):
-        if len(record.get(field, "")) > MAX_SHORT_TEXT_LENGTH:
-            raise ValueError(f"{FIELD_LABELS[field]}长度不能超过 {MAX_SHORT_TEXT_LENGTH} 个字符。")
+    for field, config in OPTION_FIELDS.items():
+        if len(record.get(field, "")) > config["max_length"]:
+            raise ValueError(f"{FIELD_LABELS[field]}长度不能超过 {config['max_length']} 个字符。")
     normalize_time(record.get("departure_time", ""))
     normalize_time(record.get("arrival_time", ""))
 
@@ -290,6 +367,140 @@ def save_data(data: dict, path: Path = DATA_FILE) -> None:
         raise
 
 
+class OptionManagerDialog(Toplevel):
+    def __init__(self, app: "FlightManagerApp", field: str, on_change=None):
+        super().__init__(app.root)
+        self.app = app
+        self.field = field
+        self.config_info = OPTION_FIELDS[field]
+        self.category = self.config_info["category"]
+        self.on_change = on_change
+        self.search_text = StringVar()
+        self.value_text = StringVar()
+        self.item_values: dict[str, str] = {}
+        self.title(f"{self.config_info['label']}管理")
+        self.geometry("520x460")
+        self.transient(app.root)
+        self.grab_set()
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill=BOTH, expand=True)
+
+        top = ttk.Frame(body)
+        top.pack(fill=X, pady=(0, 8))
+        ttk.Label(top, text="检索").pack(side=LEFT, padx=(0, 6))
+        search_entry = ttk.Entry(top, textvariable=self.search_text, width=30)
+        search_entry.pack(side=LEFT, fill=X, expand=True)
+        search_entry.bind("<KeyRelease>", lambda _event: self.refresh())
+        ttk.Button(top, text="清空", command=self.clear_search).pack(side=LEFT, padx=(8, 0))
+
+        self.table = ttk.Treeview(body, columns=("value",), show="headings", selectmode="browse")
+        self.table.heading("value", text=self.config_info["label"])
+        self.table.column("value", anchor="w", width=460)
+        self.table.pack(fill=BOTH, expand=True, pady=(0, 10))
+        self.table.bind("<<TreeviewSelect>>", lambda _event: self.load_selected())
+
+        form = ttk.Frame(body)
+        form.pack(fill=X)
+        ttk.Label(form, text=f"名称（≤{self.config_info['max_length']}字符）").pack(side=LEFT, padx=(0, 6))
+        value_entry = ttk.Entry(
+            form,
+            textvariable=self.value_text,
+            width=28,
+            validate="key",
+            validatecommand=(self.register(self.limit_value), "%P"),
+        )
+        value_entry.pack(side=LEFT, fill=X, expand=True)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=X, pady=(10, 0))
+        ttk.Button(buttons, text="新增", command=self.add_value).pack(side=LEFT, padx=(0, 8))
+        if self.config_info["allow_rename"]:
+            ttk.Button(buttons, text="修改选中", command=self.rename_selected).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="删除选中", command=self.delete_selected).pack(side=LEFT)
+        ttk.Button(buttons, text="关闭", command=self.destroy).pack(side=RIGHT)
+
+        self.refresh()
+        search_entry.focus_set()
+
+    def values(self) -> list[str]:
+        return self.app.options.get(self.category, [])
+
+    def limit_value(self, value: str) -> bool:
+        return len(value) <= self.config_info["max_length"]
+
+    def clear_search(self) -> None:
+        self.search_text.set("")
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.table.delete(*self.table.get_children())
+        self.item_values = {}
+        for index, value in enumerate(filter_options(self.values(), self.search_text.get(), limit=500)):
+            item_id = f"item-{index}"
+            self.item_values[item_id] = value
+            self.table.insert("", END, iid=item_id, values=(value,))
+
+    def load_selected(self) -> None:
+        selected = self.table.selection()
+        if selected:
+            self.value_text.set(self.item_values.get(selected[0], ""))
+
+    def validate_new_value(self, value: str) -> str | None:
+        value = value.strip()
+        if not value:
+            messagebox.showerror("名称为空", "请输入名称。", parent=self)
+            return None
+        if len(value) > self.config_info["max_length"]:
+            messagebox.showerror("名称过长", f"名称长度不能超过 {self.config_info['max_length']} 个字符。", parent=self)
+            return None
+        if value.casefold() in {item.casefold() for item in self.values()}:
+            messagebox.showerror("名称重复", "该名称已存在。", parent=self)
+            return None
+        return value
+
+    def persist(self) -> None:
+        self.app.options[self.category] = normalize_options(self.app.options.get(self.category, []), self.config_info["max_length"])
+        save_reference_options(self.app.options)
+        self.refresh()
+        if self.on_change:
+            self.on_change()
+
+    def add_value(self) -> None:
+        value = self.validate_new_value(self.value_text.get())
+        if not value:
+            return
+        self.app.options.setdefault(self.category, []).append(value)
+        self.persist()
+        self.value_text.set(value)
+
+    def rename_selected(self) -> None:
+        selected = self.table.selection()
+        if not selected:
+            messagebox.showinfo("请选择项目", "请先选择要修改的名称。", parent=self)
+            return
+        old_value = self.item_values.get(selected[0], "")
+        new_value = self.validate_new_value(self.value_text.get())
+        if not new_value:
+            return
+        values = [new_value if value == old_value else value for value in self.values()]
+        self.app.options[self.category] = values
+        self.persist()
+        self.value_text.set(new_value)
+
+    def delete_selected(self) -> None:
+        selected = self.table.selection()
+        if not selected:
+            messagebox.showinfo("请选择项目", "请先选择要删除的名称。", parent=self)
+            return
+        value = self.item_values.get(selected[0], "")
+        if not messagebox.askyesno("确认删除", f"确定删除“{value}”吗？已在航班记录中使用的值不会被自动修改。", default=messagebox.NO, parent=self):
+            return
+        self.app.options[self.category] = [item for item in self.values() if item != value]
+        self.persist()
+        self.value_text.set("")
+
+
 class FlightEditor(Toplevel):
     def __init__(self, app: "FlightManagerApp", record: dict[str, str] | None = None, focus_field: str | None = None):
         super().__init__(app.root)
@@ -297,6 +508,8 @@ class FlightEditor(Toplevel):
         self.original_id = record.get("id") if record else None
         self.record = copy.deepcopy(record) if record else blank_record()
         self.entries: dict[str, Entry] = {}
+        self.option_combos: dict[str, ttk.Combobox] = {}
+        self.time_widgets: dict[str, tuple[ttk.Combobox, ttk.Combobox]] = {}
         self.readonly_fields: set[str] = set()
         self.supplement_mode = bool(self.original_id and missing_fields(self.record))
         self.title("编辑航线" if record else "新增航线")
@@ -328,19 +541,15 @@ class FlightEditor(Toplevel):
                 self.readonly_fields.add(field)
                 value_label = ttk.Label(body, text=self.record.get(field, ""), width=30, anchor="w", relief="sunken", padding=(4, 2))
                 value_label.grid(row=row, column=1, sticky="we", pady=5)
+            elif field in {"departure_time", "arrival_time"}:
+                self.create_time_selector(body, row, field)
+            elif field in OPTION_FIELDS:
+                self.create_option_selector(body, row, field)
             else:
                 variable = StringVar(value=self.record.get(field, ""))
-                entry_options = {"textvariable": variable, "width": 30}
-                if field in {"aircraft_type", "airline"}:
-                    entry_options.update({
-                        "validate": "key",
-                        "validatecommand": (self.register(self.limit_short_text), "%P"),
-                    })
-                entry = ttk.Entry(body, **entry_options)
+                entry = ttk.Entry(body, textvariable=variable, width=30)
                 entry.grid(row=row, column=1, sticky="we", pady=5)
                 self.entries[field] = entry
-            if field in {"departure_time", "arrival_time"}:
-                ttk.Label(body, text="HH:MM 或 0815", foreground="#6B7280").grid(row=row, column=2, sticky="w", padx=(8, 0))
 
         button_bar = ttk.Frame(body)
         button_bar.grid(row=len(REQUIRED_FIELDS) + 1 + row_offset, column=0, columnspan=3, sticky="e", pady=(14, 0))
@@ -353,13 +562,74 @@ class FlightEditor(Toplevel):
         if self.entries:
             self.after(100, lambda: self.entries.get(target_field, next(iter(self.entries.values()))).focus_set())
 
-    def limit_short_text(self, value: str) -> bool:
-        return len(value) <= MAX_SHORT_TEXT_LENGTH
+    def create_time_selector(self, parent: ttk.Frame, row: int, field: str) -> None:
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=1, sticky="w", pady=5)
+        value = self.record.get(field, "")
+        hour_value, minute_value = ("", "")
+        if value and TIME_RE.fullmatch(value):
+            hour_value, minute_value = value.split(":")
+        hour_combo = ttk.Combobox(frame, width=5, values=HOUR_OPTIONS, textvariable=StringVar(value=hour_value))
+        minute_values = MINUTE_OPTIONS if not minute_value or minute_value in MINUTE_OPTIONS else sorted({*MINUTE_OPTIONS, minute_value})
+        minute_combo = ttk.Combobox(frame, width=5, values=minute_values, textvariable=StringVar(value=minute_value))
+        hour_combo.pack(side=LEFT)
+        ttk.Label(frame, text="时").pack(side=LEFT, padx=(4, 8))
+        minute_combo.pack(side=LEFT)
+        ttk.Label(frame, text="分").pack(side=LEFT, padx=(4, 0))
+        hour_combo.bind("<KeyRelease>", lambda _event, combo=hour_combo: self.filter_static_combo(combo, HOUR_OPTIONS))
+        minute_combo.bind("<KeyRelease>", lambda _event, combo=minute_combo: self.filter_static_combo(combo, MINUTE_OPTIONS))
+        self.time_widgets[field] = (hour_combo, minute_combo)
+        ttk.Label(parent, text="每 5 分钟", foreground="#6B7280").grid(row=row, column=2, sticky="w", padx=(8, 0))
+
+    def create_option_selector(self, parent: ttk.Frame, row: int, field: str) -> None:
+        config = OPTION_FIELDS[field]
+        variable = StringVar(value=self.record.get(field, ""))
+        combo = ttk.Combobox(
+            parent,
+            textvariable=variable,
+            width=27,
+            values=filter_options(self.app.option_values_for_field(field), variable.get()),
+            validate="key",
+            validatecommand=(self.register(lambda value, limit=config["max_length"]: len(value) <= limit), "%P"),
+        )
+        combo.grid(row=row, column=1, sticky="we", pady=5)
+        combo.bind("<KeyRelease>", lambda _event, item=field: self.filter_option_combo(item))
+        combo.bind("<Button-1>", lambda _event, item=field: self.filter_option_combo(item))
+        self.option_combos[field] = combo
+        ttk.Button(parent, text="管理", command=lambda item=field: self.open_option_manager(item)).grid(row=row, column=2, sticky="w", padx=(8, 0))
+
+    def filter_static_combo(self, combo: ttk.Combobox, values: list[str]) -> None:
+        combo.configure(values=filter_options(values, combo.get(), limit=len(values)))
+
+    def filter_option_combo(self, field: str) -> None:
+        combo = self.option_combos[field]
+        combo.configure(values=filter_options(self.app.option_values_for_field(field), combo.get()))
+
+    def refresh_option_combos(self) -> None:
+        for field in self.option_combos:
+            self.filter_option_combo(field)
+
+    def open_option_manager(self, field: str) -> None:
+        OptionManagerDialog(self.app, field, on_change=self.refresh_option_combos)
+
+    def collect_time(self, field: str) -> str:
+        hour_combo, minute_combo = self.time_widgets[field]
+        hour = hour_combo.get().strip()
+        minute = minute_combo.get().strip()
+        if not hour and not minute:
+            return ""
+        if hour not in HOUR_OPTIONS or minute not in MINUTE_OPTIONS:
+            raise ValueError(f"{FIELD_LABELS[field]}必须从小时 00-23 和分钟 00-55 的下拉列表中选择。")
+        return f"{hour}:{minute}"
 
     def collect_record(self) -> dict[str, str]:
         record = copy.deepcopy(self.record)
         for field, entry in self.entries.items():
             record[field] = entry.get()
+        for field, combo in self.option_combos.items():
+            record[field] = combo.get()
+        for field in self.time_widgets:
+            record[field] = self.collect_time(field)
         record["airport_code"] = record.get("airport_code", "").upper()
         record["outbound_flight_no"] = record.get("outbound_flight_no", "").upper()
         record["return_flight_no"] = record.get("return_flight_no", "").upper()
@@ -374,6 +644,7 @@ class FlightEditor(Toplevel):
         try:
             record = self.collect_record()
             validate_record(record)
+            self.app.validate_selected_options(record)
         except ValueError as exc:
             messagebox.showerror("输入有误", str(exc), parent=self)
             return
@@ -517,6 +788,7 @@ class FlightManagerApp:
         self.root.geometry("1180x760")
         self.data = load_data()
         self.records: list[dict[str, str]] = self.data["records"]
+        self.options = load_reference_options()
         self.current_results: list[dict[str, str]] = []
         self.search_vars = {
             "flight_no": StringVar(),
@@ -650,6 +922,21 @@ class FlightManagerApp:
 
     def get_criteria(self) -> dict[str, str]:
         return {key: variable.get() for key, variable in self.search_vars.items()}
+
+    def option_values_for_field(self, field: str) -> list[str]:
+        config = OPTION_FIELDS[field]
+        values = list(self.options.get(config["category"], []))
+        values.extend(record.get(field, "") for record in self.records if record.get(field, ""))
+        return normalize_options(values, config["max_length"])
+
+    def validate_selected_options(self, record: dict[str, str]) -> None:
+        for field in OPTION_FIELDS:
+            value = record.get(field, "").strip()
+            if not value:
+                continue
+            allowed = set(self.option_values_for_field(field))
+            if value not in allowed:
+                raise ValueError(f"{FIELD_LABELS[field]}必须从下拉列表中选择。若需要新增，请点击旁边的“管理”按钮。")
 
     def refresh(self, select_id: str | None = None) -> None:
         criteria = self.get_criteria()

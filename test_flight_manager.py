@@ -8,10 +8,15 @@ from pathlib import Path
 
 from flight_manager import (
     DATA_FILE,
+    HOUR_OPTIONS,
+    MINUTE_OPTIONS,
+    REFERENCE_OPTIONS_FILE,
     blank_record,
     filter_records,
+    filter_options,
     find_time_conflicts,
     load_data,
+    load_reference_options,
     missing_fields,
     needs_pairing,
     normalize_time,
@@ -149,7 +154,27 @@ class FlightScheduleDataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_record({**record, "airport_code": "J1K"})
         with self.assertRaises(ValueError):
-            validate_record({**record, "aircraft_type": "A" * 51})
+            validate_record({**record, "aircraft_type": "A" * 26})
+        with self.assertRaises(ValueError):
+            validate_record({**record, "airline": "A" * 26})
+        with self.assertRaises(ValueError):
+            validate_record({**record, "country_or_region": "A" * 51})
+
+    def test_reference_options_include_current_sovereign_state_set(self) -> None:
+        options = load_reference_options(REFERENCE_OPTIONS_FILE)
+        countries = options["countries_or_regions"]
+        self.assertEqual(len(countries), 195)
+        for country in ("USA", "UK", "UAE", "France", "Holy See", "Palestine"):
+            self.assertIn(country, countries)
+
+    def test_dropdown_filtering_prioritizes_prefix_then_contains(self) -> None:
+        values = ["France", "South Africa", "Afghanistan", "Finland"]
+        self.assertEqual(filter_options(values, "F"), ["France", "Finland", "South Africa", "Afghanistan"])
+
+    def test_time_dropdown_options_cover_required_intervals(self) -> None:
+        self.assertEqual(HOUR_OPTIONS[0], "00")
+        self.assertEqual(HOUR_OPTIONS[-1], "23")
+        self.assertEqual(MINUTE_OPTIONS, ["00", "05", "10", "15", "20", "25", "30", "35", "40", "45", "50", "55"])
 
     def test_strong_pair_candidate_uses_same_airport_and_complementary_time(self) -> None:
         original = {

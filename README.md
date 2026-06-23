@@ -6,6 +6,7 @@ A local Python desktop tool for managing airport flight route schedule data.
 
 - `airport_flight_schedule.xlsx`: original workbook source.
 - `flight_schedule.json`: converted local data file used by the app.
+- `reference_options.json`: local dropdown dictionaries for aircraft types, airlines, and countries/regions.
 - `flight_manager.py`: Tkinter GUI for adding, searching, editing, deleting, and supplementing route records.
 - `test_flight_manager.py`: unit tests for import integrity, search, conflict detection, and JSON round-trip behavior.
 
@@ -22,7 +23,9 @@ The app only reads and writes `flight_schedule.json` locally.
 - Add, edit, delete, and precisely search route records.
 - New records must include every required field before they can be saved.
 - Flight numbers must use two letters plus 1-4 digits, and airport codes must use three letters.
-- Times can be entered as `HH:MM` or four digits such as `0815`, which is saved as `08:15`.
+- Departure and arrival times are selected with separate hour and five-minute interval dropdowns.
+- Aircraft type, airline, and country/region fields are searchable dropdowns; typed text only filters choices and must match an existing option to save.
+- Aircraft type and airline options are managed in local popups and are limited to 25 characters; countries/regions are limited to 50 characters and can also be renamed.
 - Warn when departure or arrival times are already occupied.
 - Mark records with missing required fields for later completion.
 - Manually associate outbound and return flight records after legacy records are completed, using same-airport existing records as candidates.
