@@ -8,11 +8,15 @@ from pathlib import Path
 
 from flight_manager import (
     DATA_FILE,
+    blank_record,
     filter_records,
     find_time_conflicts,
     load_data,
     missing_fields,
+    needs_pairing,
     normalize_time,
+    paired_group,
+    route_info_complete,
     save_data,
 )
 
@@ -38,6 +42,7 @@ class FlightScheduleDataTests(unittest.TestCase):
         first = self.records[0]
         for field in ("outbound_flight_no", "return_flight_no", "aircraft_type", "airline", "country_or_region"):
             self.assertEqual(first[field], "")
+        self.assertEqual(first["route_pair_id"], "")
         self.assertIn("outbound_flight_no", missing_fields(first))
         self.assertIn("aircraft_type", missing_fields(first))
 
@@ -55,6 +60,64 @@ class FlightScheduleDataTests(unittest.TestCase):
         self.assertGreaterEqual(len(conflicts), 3)
         self.assertIn("离港", {conflict["type"] for conflict in conflicts})
         self.assertIn("到达", {conflict["type"] for conflict in conflicts})
+
+    def test_associated_record_is_included_in_precise_flight_query(self) -> None:
+        records = [
+            {
+                **blank_record(),
+                "id": "outbound",
+                "outbound_flight_no": "FB100",
+                "return_flight_no": "",
+                "airport_code": "JFK",
+                "departure_time": "08:00",
+                "arrival_time": "",
+                "aircraft_type": "A350",
+                "airline": "French bee",
+                "country_or_region": "United States",
+                "route_pair_id": "pair-test",
+            },
+            {
+                **blank_record(),
+                "id": "return",
+                "outbound_flight_no": "",
+                "return_flight_no": "FB101",
+                "airport_code": "JFK",
+                "departure_time": "",
+                "arrival_time": "20:00",
+                "aircraft_type": "A350",
+                "airline": "French bee",
+                "country_or_region": "United States",
+                "route_pair_id": "pair-test",
+            },
+        ]
+        result = filter_records(records, {"flight_no": "FB100"})
+        self.assertEqual([record["id"] for record in result], ["outbound", "return"])
+
+    def test_complete_unpaired_record_requires_manual_pairing(self) -> None:
+        record = {
+            **blank_record(),
+            "outbound_flight_no": "FB200",
+            "return_flight_no": "FB201",
+            "airport_code": "LAX",
+            "departure_time": "09:00",
+            "arrival_time": "21:00",
+            "aircraft_type": "A350",
+            "airline": "French bee",
+            "country_or_region": "United States",
+        }
+        self.assertTrue(route_info_complete(record))
+        self.assertTrue(needs_pairing(record))
+        record["route_pair_id"] = "pair-complete"
+        self.assertFalse(needs_pairing(record))
+
+    def test_paired_group_requires_pair_id(self) -> None:
+        paired = [
+            {**blank_record(), "id": "a", "route_pair_id": "pair-a"},
+            {**blank_record(), "id": "b", "route_pair_id": "pair-a"},
+            {**blank_record(), "id": "c", "route_pair_id": ""},
+        ]
+        self.assertEqual([record["id"] for record in paired_group(paired, paired[0])], ["a", "b"])
+        self.assertEqual(paired_group(paired, paired[2]), [])
 
     def test_time_normalization(self) -> None:
         self.assertEqual(normalize_time("6:30:00"), "06:30")
