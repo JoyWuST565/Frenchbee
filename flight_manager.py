@@ -1,21 +1,91 @@
 from __future__ import annotations
 
 import copy
+import csv
+import importlib
 import json
 import os
 import re
+import shutil
+import sqlite3
+import sys
 import tempfile
 import uuid
+import webbrowser
+import zipfile
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, TOP, VERTICAL, X, Y, Button, Entry, Label, StringVar, Tk, Toplevel, messagebox
-from tkinter import ttk
+from xml.sax.saxutils import escape
 
 
-APP_DIR = Path(__file__).resolve().parent
-DATA_FILE = APP_DIR / "flight_schedule.json"
-REFERENCE_OPTIONS_FILE = APP_DIR / "reference_options.json"
+def runtime_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.argv[0]).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resource_dir() -> Path:
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
+def load_tkinter_runtime():
+    if getattr(sys, "frozen", False):
+        resources = resource_dir()
+        if str(resources) not in sys.path:
+            sys.path.insert(0, str(resources))
+        os.environ.setdefault("TCL_LIBRARY", str(resources / "tcl" / "tcl8.6"))
+        os.environ.setdefault("TK_LIBRARY", str(resources / "tcl" / "tk8.6"))
+    tk_module = importlib.import_module("tkinter")
+    ttk_module = importlib.import_module("tkinter.ttk")
+    filedialog_module = importlib.import_module("tkinter.filedialog")
+    messagebox_module = importlib.import_module("tkinter.messagebox")
+    return tk_module, ttk_module, filedialog_module, messagebox_module
+
+
+tk, ttk, filedialog, messagebox = load_tkinter_runtime()
+BOTH = tk.BOTH
+END = tk.END
+LEFT = tk.LEFT
+RIGHT = tk.RIGHT
+TOP = tk.TOP
+VERTICAL = tk.VERTICAL
+X = tk.X
+Y = tk.Y
+Button = tk.Button
+Entry = tk.Entry
+Label = tk.Label
+StringVar = tk.StringVar
+Tk = tk.Tk
+Toplevel = tk.Toplevel
+
+
+APP_NAME = "Frenchbee Flight Manager"
+APP_DISPLAY_NAME = "Frenchbee 航班航线管理"
+APP_VERSION = "1.2.0"
+APP_AUTHOR = "JoyWuST565"
+GITHUB_URL = "https://github.com/JoyWuST565/Frenchbee"
+APP_DIR = runtime_dir()
+RESOURCE_DIR = resource_dir()
+DB_FILE = APP_DIR / "flight_schedule.db"
+BUNDLED_DB_FILE = RESOURCE_DIR / "flight_schedule.db"
+RUNTIME_DATA_FILE = APP_DIR / "flight_schedule.json"
+BUNDLED_DATA_FILE = RESOURCE_DIR / "flight_schedule.json"
+DATA_FILE = RUNTIME_DATA_FILE if RUNTIME_DATA_FILE.exists() else BUNDLED_DATA_FILE
+RUNTIME_REFERENCE_OPTIONS_FILE = APP_DIR / "reference_options.json"
+BUNDLED_REFERENCE_OPTIONS_FILE = RESOURCE_DIR / "reference_options.json"
+REFERENCE_OPTIONS_FILE = RUNTIME_REFERENCE_OPTIONS_FILE if RUNTIME_REFERENCE_OPTIONS_FILE.exists() else BUNDLED_REFERENCE_OPTIONS_FILE
+APP_ICON_FILE = RESOURCE_DIR / "frenchbee_flight_manager.ico"
 SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 1
+SUPPLEMENTARY_FIELDS = (
+    "outbound_flight_no",
+    "return_flight_no",
+    "aircraft_type",
+    "airline",
+    "country_or_region",
+    "route_pair_id",
+)
 
 FIELD_LABELS = {
     "airline": "航司",
@@ -52,6 +122,30 @@ DATA_FIELDS = (
     "source",
     "updated_at",
 )
+DISPLAY_COLUMNS = (
+    "status",
+    "outbound_flight_no",
+    "return_flight_no",
+    "airport_code",
+    "departure_time",
+    "arrival_time",
+    "aircraft_type",
+    "airline",
+    "country_or_region",
+    "route_pair_id",
+)
+DISPLAY_HEADINGS = {
+    "status": "状态",
+    "outbound_flight_no": "去程航班号",
+    "return_flight_no": "返程航班号",
+    "airport_code": "机场",
+    "departure_time": "去程离港",
+    "arrival_time": "返程抵港",
+    "aircraft_type": "机型",
+    "airline": "航空公司",
+    "country_or_region": "国家/地区",
+    "route_pair_id": "关联ID",
+}
 
 TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 SIMPLE_TIME_RE = re.compile(r"^\d{4}$")
@@ -147,7 +241,15 @@ def normalize_airline_codes(airlines: list[str], codes: dict) -> dict[str, str]:
     return normalized
 
 
-def load_reference_options(path: Path = REFERENCE_OPTIONS_FILE) -> dict:
+class DatabaseStartupError(RuntimeError):
+    pass
+
+
+def is_database_path(path: Path) -> bool:
+    return path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+
+
+def load_reference_options_json(path: Path = REFERENCE_OPTIONS_FILE) -> dict:
     if path.exists():
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -161,12 +263,17 @@ def load_reference_options(path: Path = REFERENCE_OPTIONS_FILE) -> dict:
     return options
 
 
-def save_reference_options(options: dict, path: Path = REFERENCE_OPTIONS_FILE) -> None:
+def normalized_reference_payload(options: dict) -> dict:
     payload = {
         config["category"]: normalize_options(options.get(config["category"], []), config["max_length"])
         for config in OPTION_FIELDS.values()
     }
     payload["airline_codes"] = normalize_airline_codes(payload["airlines"], options.get("airline_codes", {}))
+    return payload
+
+
+def save_reference_options_json(options: dict, path: Path = REFERENCE_OPTIONS_FILE) -> None:
+    payload = normalized_reference_payload(options)
     temp_name = ""
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False, prefix=".reference_options.", suffix=".tmp") as handle:
@@ -178,6 +285,313 @@ def save_reference_options(options: dict, path: Path = REFERENCE_OPTIONS_FILE) -
         if temp_name and os.path.exists(temp_name):
             os.remove(temp_name)
         raise
+
+
+def connect_database(path: Path = DB_FILE) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def create_database_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS flights (
+            id TEXT PRIMARY KEY,
+            outbound_flight_no TEXT NOT NULL DEFAULT '',
+            return_flight_no TEXT NOT NULL DEFAULT '',
+            airport_code TEXT NOT NULL DEFAULT '',
+            departure_time TEXT NOT NULL DEFAULT '',
+            arrival_time TEXT NOT NULL DEFAULT '',
+            aircraft_type TEXT NOT NULL DEFAULT '',
+            airline TEXT NOT NULL DEFAULT '',
+            country_or_region TEXT NOT NULL DEFAULT '',
+            route_pair_id TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            updated_at TEXT NOT NULL DEFAULT '',
+            display_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS reference_options (
+            category TEXT NOT NULL,
+            value TEXT NOT NULL,
+            airline_code TEXT NOT NULL DEFAULT '',
+            display_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (category, value)
+        );
+        """
+    )
+    connection.execute(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
+        ("database_schema_version", str(DATABASE_SCHEMA_VERSION)),
+    )
+
+
+def check_database_integrity(path: Path = DB_FILE) -> None:
+    try:
+        with closing(connect_database(path)) as connection:
+            result = connection.execute("PRAGMA integrity_check").fetchone()
+            if not result or result[0] != "ok":
+                raise DatabaseStartupError(f"数据库完整性检查失败：{result[0] if result else '无返回结果'}")
+            tables = {
+                row["name"]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            required = {"metadata", "flights", "reference_options"}
+            missing = required - tables
+            if missing:
+                raise DatabaseStartupError("数据库缺少必要数据表：" + "、".join(sorted(missing)))
+    except sqlite3.DatabaseError as exc:
+        raise DatabaseStartupError(
+            "数据库文件无法打开，可能已损坏或不是有效的 SQLite 文件。\n\n"
+            f"文件位置：{path}\n错误信息：{exc}\n\n"
+            "请使用“恢复备份”功能恢复一个有效备份，或保留当前文件后重新创建数据库。"
+        ) from exc
+
+
+def load_json_data(path: Path = DATA_FILE) -> dict:
+    if not path.exists():
+        return {"schema_version": SCHEMA_VERSION, "records": []}
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    records = [normalize_record(record) for record in data.get("records", [])]
+    return {
+        "schema_version": data.get("schema_version", SCHEMA_VERSION),
+        "generated_from": data.get("generated_from", ""),
+        "generated_at": data.get("generated_at", ""),
+        "records": records,
+    }
+
+
+def save_json_data(data: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = copy.deepcopy(data)
+    payload["schema_version"] = SCHEMA_VERSION
+    payload["records"] = [normalize_record(record) for record in payload.get("records", [])]
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False, prefix=".flight_schedule.", suffix=".tmp") as handle:
+            temp_name = handle.name
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_name, path)
+    except Exception:
+        if temp_name and os.path.exists(temp_name):
+            os.remove(temp_name)
+        raise
+
+
+def write_records_to_database(connection: sqlite3.Connection, records: list[dict[str, str]]) -> None:
+    connection.execute("DELETE FROM flights")
+    for index, record in enumerate(records):
+        normalized = normalize_record(record)
+        connection.execute(
+            """
+            INSERT INTO flights(
+                id, outbound_flight_no, return_flight_no, airport_code, departure_time,
+                arrival_time, aircraft_type, airline, country_or_region, route_pair_id,
+                source, updated_at, display_order
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(normalized[field] for field in DATA_FIELDS) + (index,),
+        )
+
+
+def useful_legacy_field_count(records: list[dict[str, str]]) -> int:
+    return sum(
+        1
+        for record in records
+        for field in SUPPLEMENTARY_FIELDS
+        if str(record.get(field, "")).strip()
+    )
+
+
+def merge_import_record(existing: dict[str, str] | None, incoming: dict[str, str]) -> dict[str, str]:
+    if not existing:
+        return incoming
+    merged = copy.deepcopy(existing)
+    for field in DATA_FIELDS:
+        incoming_value = incoming.get(field, "")
+        if field in {"id", "updated_at"}:
+            merged[field] = incoming_value or merged.get(field, "")
+        elif str(incoming_value).strip():
+            merged[field] = incoming_value
+    merged["updated_at"] = incoming.get("updated_at") or now_iso()
+    return normalize_record(merged)
+
+
+def upsert_records_to_database(connection: sqlite3.Connection, records: list[dict[str, str]], preserve_existing_on_blank: bool = False) -> int:
+    max_order = connection.execute("SELECT COALESCE(MAX(display_order), -1) FROM flights").fetchone()[0]
+    imported = 0
+    for offset, record in enumerate(records, start=1):
+        normalized = normalize_record(record)
+        current = connection.execute("SELECT * FROM flights WHERE id = ?", (normalized["id"],)).fetchone()
+        current_order = current["display_order"] if current else None
+        if preserve_existing_on_blank and current:
+            normalized = merge_import_record(dict(current), normalized)
+        display_order = current_order if current_order is not None else max_order + offset
+        connection.execute(
+            """
+            INSERT INTO flights(
+                id, outbound_flight_no, return_flight_no, airport_code, departure_time,
+                arrival_time, aircraft_type, airline, country_or_region, route_pair_id,
+                source, updated_at, display_order
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                outbound_flight_no=excluded.outbound_flight_no,
+                return_flight_no=excluded.return_flight_no,
+                airport_code=excluded.airport_code,
+                departure_time=excluded.departure_time,
+                arrival_time=excluded.arrival_time,
+                aircraft_type=excluded.aircraft_type,
+                airline=excluded.airline,
+                country_or_region=excluded.country_or_region,
+                route_pair_id=excluded.route_pair_id,
+                source=excluded.source,
+                updated_at=excluded.updated_at,
+                display_order=excluded.display_order
+            """,
+            tuple(normalized[field] for field in DATA_FIELDS) + (display_order,),
+        )
+        imported += 1
+    return imported
+
+
+def write_reference_options_to_database(connection: sqlite3.Connection, options: dict) -> None:
+    payload = normalized_reference_payload(options)
+    connection.execute("DELETE FROM reference_options")
+    airline_codes = payload.get("airline_codes", {})
+    for field, config in OPTION_FIELDS.items():
+        category = config["category"]
+        for index, value in enumerate(payload.get(category, [])):
+            connection.execute(
+                "INSERT INTO reference_options(category, value, airline_code, display_order) VALUES (?, ?, ?, ?)",
+                (category, value, airline_codes.get(value, "") if field == "airline" else "", index),
+            )
+
+
+def create_database_from_payload(path: Path, data: dict | None = None, options: dict | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(connect_database(path)) as connection:
+        create_database_schema(connection)
+        write_records_to_database(connection, (data or {}).get("records", []))
+        write_reference_options_to_database(connection, options or {})
+        for key in ("schema_version", "generated_from", "generated_at"):
+            value = str((data or {}).get(key, SCHEMA_VERSION if key == "schema_version" else ""))
+            connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", (key, value))
+        connection.commit()
+
+
+def legacy_json_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    for path in (RUNTIME_DATA_FILE, BUNDLED_DATA_FILE):
+        if path.exists() and path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def reference_options_for_legacy_json(json_path: Path) -> dict:
+    if json_path.parent == RUNTIME_REFERENCE_OPTIONS_FILE.parent and RUNTIME_REFERENCE_OPTIONS_FILE.exists():
+        return load_reference_options_json(RUNTIME_REFERENCE_OPTIONS_FILE)
+    return load_reference_options_json(REFERENCE_OPTIONS_FILE)
+
+
+def best_legacy_json_data() -> tuple[Path | None, dict]:
+    best_path: Path | None = None
+    best_data: dict = {"schema_version": SCHEMA_VERSION, "records": []}
+    best_score = -1
+    for path in legacy_json_candidates():
+        try:
+            data = load_json_data(path)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        score = useful_legacy_field_count(data.get("records", []))
+        if score > best_score:
+            best_path = path
+            best_data = data
+            best_score = score
+    return best_path, best_data
+
+
+def maybe_import_runtime_legacy_json(path: Path = DB_FILE) -> int:
+    if path.resolve() != DB_FILE.resolve() or not RUNTIME_DATA_FILE.exists():
+        return 0
+    try:
+        data = load_json_data(RUNTIME_DATA_FILE)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return 0
+    if useful_legacy_field_count(data.get("records", [])) == 0:
+        return 0
+    with closing(connect_database(path)) as connection:
+        imported = upsert_records_to_database(connection, data.get("records", []), preserve_existing_on_blank=True)
+        connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", ("legacy_json_imported_from", str(RUNTIME_DATA_FILE)))
+        connection.commit()
+    return imported
+
+
+def ensure_database(path: Path = DB_FILE) -> None:
+    if path.exists():
+        check_database_integrity(path)
+        maybe_import_runtime_legacy_json(path)
+        return
+    is_primary_database = path.resolve() == DB_FILE.resolve()
+    legacy_path, legacy_data = best_legacy_json_data() if is_primary_database else (None, {"schema_version": SCHEMA_VERSION, "records": []})
+    if is_primary_database and legacy_path and useful_legacy_field_count(legacy_data.get("records", [])) > 0:
+        create_database_from_payload(path, legacy_data, reference_options_for_legacy_json(legacy_path))
+        check_database_integrity(path)
+        return
+    if is_primary_database and BUNDLED_DB_FILE.exists() and BUNDLED_DB_FILE.resolve() != path.resolve():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(BUNDLED_DB_FILE, path)
+        maybe_import_runtime_legacy_json(path)
+        check_database_integrity(path)
+        return
+    data = legacy_data if is_primary_database else {"schema_version": SCHEMA_VERSION, "records": []}
+    options = load_reference_options_json(REFERENCE_OPTIONS_FILE) if is_primary_database else {}
+    create_database_from_payload(path, data, options)
+    check_database_integrity(path)
+
+
+def load_reference_options(path: Path = DB_FILE) -> dict:
+    if not is_database_path(path):
+        return load_reference_options_json(path)
+    ensure_database(path)
+    options = {config["category"]: [] for config in OPTION_FIELDS.values()}
+    airline_codes: dict[str, str] = {}
+    with closing(connect_database(path)) as connection:
+        for row in connection.execute("SELECT category, value, airline_code FROM reference_options ORDER BY display_order, value"):
+            category = row["category"]
+            value = row["value"]
+            if category in options:
+                options[category].append(value)
+                if category == OPTION_FIELDS["airline"]["category"] and row["airline_code"]:
+                    airline_codes[value] = row["airline_code"]
+    options = {
+        config["category"]: normalize_options(options.get(config["category"], []), config["max_length"])
+        for config in OPTION_FIELDS.values()
+    }
+    options["airline_codes"] = normalize_airline_codes(options["airlines"], airline_codes)
+    return options
+
+
+def save_reference_options(options: dict, path: Path = DB_FILE) -> None:
+    if not is_database_path(path):
+        save_reference_options_json(options, path)
+        return
+    payload = {
+        config["category"]: normalize_options(options.get(config["category"], []), config["max_length"])
+        for config in OPTION_FIELDS.values()
+    }
+    payload["airline_codes"] = normalize_airline_codes(payload["airlines"], options.get("airline_codes", {}))
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        write_reference_options_to_database(connection, payload)
+        connection.commit()
 
 
 def filter_options(values: list[str], term: str, limit: int | None = 80) -> list[str]:
@@ -515,36 +929,144 @@ def find_time_conflicts(records: list[dict[str, str]], candidate: dict[str, str]
     return conflicts
 
 
-def load_data(path: Path = DATA_FILE) -> dict:
-    if not path.exists():
-        return {"schema_version": SCHEMA_VERSION, "records": []}
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    records = [normalize_record(record) for record in data.get("records", [])]
+def load_data(path: Path = DB_FILE) -> dict:
+    if not is_database_path(path):
+        return load_json_data(path)
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        metadata = {
+            row["key"]: row["value"]
+            for row in connection.execute("SELECT key, value FROM metadata")
+        }
+        records = [
+            normalize_record(dict(row))
+            for row in connection.execute(
+                """
+                SELECT id, outbound_flight_no, return_flight_no, airport_code,
+                       departure_time, arrival_time, aircraft_type, airline,
+                       country_or_region, route_pair_id, source, updated_at
+                FROM flights
+                ORDER BY display_order, id
+                """
+            )
+        ]
     return {
-        "schema_version": data.get("schema_version", SCHEMA_VERSION),
-        "generated_from": data.get("generated_from", ""),
-        "generated_at": data.get("generated_at", ""),
+        "schema_version": int(metadata.get("schema_version", SCHEMA_VERSION) or SCHEMA_VERSION),
+        "generated_from": metadata.get("generated_from", ""),
+        "generated_at": metadata.get("generated_at", ""),
         "records": records,
     }
 
 
-def save_data(data: dict, path: Path = DATA_FILE) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = copy.deepcopy(data)
-    payload["schema_version"] = SCHEMA_VERSION
-    payload["records"] = [normalize_record(record) for record in payload.get("records", [])]
-    temp_name = ""
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False, prefix=".flight_schedule.", suffix=".tmp") as handle:
-            temp_name = handle.name
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        os.replace(temp_name, path)
-    except Exception:
-        if temp_name and os.path.exists(temp_name):
-            os.remove(temp_name)
-        raise
+def save_data(data: dict, path: Path = DB_FILE) -> None:
+    if not is_database_path(path):
+        save_json_data(data, path)
+        return
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        create_database_schema(connection)
+        write_records_to_database(connection, data.get("records", []))
+        for key in ("schema_version", "generated_from", "generated_at"):
+            value = str(data.get(key, SCHEMA_VERSION if key == "schema_version" else ""))
+            connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", (key, value))
+        connection.commit()
+
+
+def import_json_records_to_database(json_path: Path, db_path: Path = DB_FILE) -> int:
+    data = load_json_data(json_path)
+    records = data.get("records", [])
+    if not records:
+        raise ValueError("所选 JSON 文件中没有可导入的航班记录。")
+    ensure_database(db_path)
+    with closing(connect_database(db_path)) as connection:
+        imported = upsert_records_to_database(connection, records, preserve_existing_on_blank=True)
+        connection.commit()
+        return imported
+
+
+def column_letter(index: int) -> str:
+    letters = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def xlsx_cell_xml(row_index: int, col_index: int, value: str) -> str:
+    cell_ref = f"{column_letter(col_index)}{row_index}"
+    text = escape(str(value or ""))
+    return f'<c r="{cell_ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+
+
+def write_xlsx(path: Path, headers: list[str], rows: list[list[str]]) -> None:
+    sheet_rows = [headers] + rows
+    sheet_xml_rows = []
+    for row_index, row in enumerate(sheet_rows, start=1):
+        cells = "".join(xlsx_cell_xml(row_index, col_index, value) for col_index, value in enumerate(row, start=1))
+        sheet_xml_rows.append(f'<row r="{row_index}">{cells}</row>')
+    dimension = f"A1:{column_letter(len(headers))}{max(1, len(sheet_rows))}"
+    worksheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="{dimension}"/>'
+        '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+        '<sheetData>'
+        + "".join(sheet_xml_rows)
+        + "</sheetData></worksheet>"
+    )
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
+        "</styleSheet>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="航班数据" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet_xml)
+        archive.writestr("xl/styles.xml", styles_xml)
+
+
+def write_csv(path: Path, headers: list[str], rows: list[list[str]]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        writer.writerows(rows)
 
 
 class OptionManagerDialog(Toplevel):
@@ -1085,8 +1607,14 @@ class PairDialog(Toplevel):
 class FlightManagerApp:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("航班航线本地管理")
+        ensure_database()
+        self.root.title(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
         self.root.geometry("1280x780")
+        if APP_ICON_FILE.exists():
+            try:
+                self.root.iconbitmap(str(APP_ICON_FILE))
+            except Exception:
+                pass
         self.data = load_data()
         self.records: list[dict[str, str]] = self.data["records"]
         self.options = load_reference_options()
@@ -1131,6 +1659,8 @@ class FlightManagerApp:
         search_times.grid(row=2, column=0, sticky="w", pady=(8, 0))
         search_buttons = ttk.Frame(search_frame)
         search_buttons.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        utility_buttons = ttk.Frame(search_frame)
+        utility_buttons.grid(row=4, column=0, sticky="w", pady=(8, 0))
         search_frame.columnconfigure(0, weight=1)
 
         for key, label_text, width in (
@@ -1168,6 +1698,15 @@ class FlightManagerApp:
         ):
             ttk.Button(search_buttons, text=text, command=command).pack(side=LEFT, padx=(0, 6))
 
+        for text, command in (
+            ("备份数据库", self.backup_database),
+            ("恢复备份", self.restore_database_backup),
+            ("导出 Excel/CSV", self.export_visible_data),
+            ("从 JSON 导入旧数据", self.import_legacy_json),
+            ("关于", self.show_about),
+        ):
+            ttk.Button(utility_buttons, text=text, command=command).pack(side=LEFT, padx=(0, 6))
+
         content = ttk.PanedWindow(root_frame, orient="horizontal")
         content.pack(fill=BOTH, expand=True, pady=(12, 8))
 
@@ -1176,31 +1715,9 @@ class FlightManagerApp:
         content.add(table_frame, weight=4)
         content.add(reminder_frame, weight=2)
 
-        columns = (
-            "status",
-            "outbound_flight_no",
-            "return_flight_no",
-            "airport_code",
-            "departure_time",
-            "arrival_time",
-            "aircraft_type",
-            "airline",
-            "country_or_region",
-            "route_pair_id",
-        )
+        columns = DISPLAY_COLUMNS
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
-        self.table_headings = {
-            "status": "状态",
-            "outbound_flight_no": "去程航班号",
-            "return_flight_no": "返程航班号",
-            "airport_code": "机场",
-            "departure_time": "去程离港",
-            "arrival_time": "返程抵港",
-            "aircraft_type": "机型",
-            "airline": "航空公司",
-            "country_or_region": "国家/地区",
-            "route_pair_id": "关联ID",
-        }
+        self.table_headings = dict(DISPLAY_HEADINGS)
         widths = {
             "status": 95,
             "outbound_flight_no": 100,
@@ -1245,7 +1762,7 @@ class FlightManagerApp:
         status_bar = ttk.Frame(root_frame)
         status_bar.pack(fill=X)
         ttk.Label(status_bar, textvariable=self.status_var, foreground="#374151").pack(side=LEFT)
-        ttk.Label(status_bar, text=f"数据文件：{DATA_FILE.name}", foreground="#6B7280").pack(side=RIGHT)
+        ttk.Label(status_bar, text=f"数据库：{DB_FILE.name}", foreground="#6B7280").pack(side=RIGHT)
 
     def sort_heading_text(self, column: str) -> str:
         label = self.table_headings.get(column, column)
@@ -1351,6 +1868,150 @@ class FlightManagerApp:
             allowed = set(self.option_values_for_field(field))
             if value not in allowed:
                 raise ValueError(f"{FIELD_LABELS[field]}必须从下拉列表中选择。若需要新增，请点击旁边的“管理”按钮。")
+
+    def reload_from_database(self, select_id: str | None = None) -> None:
+        self.data = load_data()
+        self.records = self.data["records"]
+        self.options = load_reference_options()
+        self.refresh_search_option_combos()
+        self.refresh(select_id=select_id)
+
+    def current_export_rows(self) -> tuple[list[str], list[list[str]]]:
+        headers = [DISPLAY_HEADINGS[column] for column in DISPLAY_COLUMNS]
+        rows = [
+            [group_display_value(group, column) for column in DISPLAY_COLUMNS]
+            for group in self.current_display_groups
+        ]
+        return headers, rows
+
+    def backup_database(self) -> None:
+        try:
+            ensure_database()
+        except DatabaseStartupError as exc:
+            messagebox.showerror("数据库无法备份", str(exc), parent=self.root)
+            return
+        default_name = f"flight_schedule_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        target = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="备份数据库",
+            initialfile=default_name,
+            defaultextension=".db",
+            filetypes=[("SQLite 数据库", "*.db"), ("所有文件", "*.*")],
+        )
+        if not target:
+            return
+        try:
+            shutil.copy2(DB_FILE, target)
+        except OSError as exc:
+            messagebox.showerror("备份失败", f"无法写入备份文件：\n{exc}", parent=self.root)
+            return
+        messagebox.showinfo("备份完成", f"数据库已备份到：\n{target}", parent=self.root)
+
+    def restore_database_backup(self) -> None:
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            title="恢复数据库备份",
+            filetypes=[("SQLite 数据库", "*.db;*.sqlite;*.sqlite3"), ("所有文件", "*.*")],
+        )
+        if not source:
+            return
+        source_path = Path(source)
+        try:
+            check_database_integrity(source_path)
+        except DatabaseStartupError as exc:
+            messagebox.showerror("备份文件不可用", str(exc), parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "确认恢复备份",
+            "恢复备份会用所选数据库替换当前数据库。程序会先自动保存一份当前数据库的安全备份。\n\n是否继续？",
+            default=messagebox.NO,
+            parent=self.root,
+        ):
+            return
+        try:
+            safety_backup = DB_FILE.with_name(f"flight_schedule_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+            if DB_FILE.exists():
+                shutil.copy2(DB_FILE, safety_backup)
+            shutil.copy2(source_path, DB_FILE)
+            self.reload_from_database()
+        except (OSError, DatabaseStartupError) as exc:
+            messagebox.showerror("恢复失败", f"无法恢复数据库备份：\n{exc}", parent=self.root)
+            return
+        messagebox.showinfo("恢复完成", "数据库备份已恢复，主界面数据已刷新。", parent=self.root)
+
+    def export_visible_data(self) -> None:
+        headers, rows = self.current_export_rows()
+        if not rows:
+            messagebox.showinfo("无可导出数据", "当前查询结果为空，没有可导出的航线。", parent=self.root)
+            return
+        target = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出当前显示数据",
+            initialfile=f"flight_schedule_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx"), ("CSV 文件", "*.csv")],
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        if target_path.suffix.lower() not in {".xlsx", ".csv"}:
+            target_path = target_path.with_suffix(".xlsx")
+        try:
+            if target_path.suffix.lower() == ".csv":
+                write_csv(target_path, headers, rows)
+            else:
+                write_xlsx(target_path, headers, rows)
+        except OSError as exc:
+            messagebox.showerror("导出失败", f"无法写入导出文件：\n{exc}", parent=self.root)
+            return
+        messagebox.showinfo("导出完成", f"当前显示数据已导出到：\n{target_path}", parent=self.root)
+
+    def import_legacy_json(self) -> None:
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            title="从 JSON 导入旧数据",
+            filetypes=[("JSON 数据文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not source:
+            return
+        if not messagebox.askyesno(
+            "确认导入",
+            "将从所选 JSON 文件导入航班记录。相同 ID 的记录会更新，新的 ID 会新增。\n\n是否继续？",
+            default=messagebox.NO,
+            parent=self.root,
+        ):
+            return
+        try:
+            imported = import_json_records_to_database(Path(source))
+            self.reload_from_database()
+        except (OSError, ValueError, json.JSONDecodeError, DatabaseStartupError) as exc:
+            messagebox.showerror("导入失败", f"无法导入所选 JSON 文件：\n{exc}", parent=self.root)
+            return
+        messagebox.showinfo("导入完成", f"已导入或更新 {imported} 条航班记录。", parent=self.root)
+
+    def show_about(self) -> None:
+        about = Toplevel(self.root)
+        about.title("关于")
+        about.resizable(False, False)
+        about.transient(self.root)
+        about.grab_set()
+        if APP_ICON_FILE.exists():
+            try:
+                about.iconbitmap(str(APP_ICON_FILE))
+            except Exception:
+                pass
+
+        body = ttk.Frame(about, padding=18)
+        body.pack(fill=BOTH, expand=True)
+        ttk.Label(body, text=APP_DISPLAY_NAME, font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 8))
+        ttk.Label(body, text=f"版本：{APP_VERSION}").pack(anchor="w", pady=2)
+        ttk.Label(body, text=f"作者：{APP_AUTHOR}").pack(anchor="w", pady=2)
+        ttk.Label(body, text=f"数据库：{DB_FILE}").pack(anchor="w", pady=2)
+        ttk.Label(body, text="GitHub：").pack(anchor="w", pady=(10, 2))
+        link = ttk.Label(body, text=GITHUB_URL, foreground="#2563EB", cursor="hand2")
+        link.pack(anchor="w")
+        link.bind("<Button-1>", lambda _event: webbrowser.open(GITHUB_URL))
+        ttk.Button(body, text="关闭", command=about.destroy).pack(anchor="e", pady=(14, 0))
 
     def refresh(self, select_id: str | None = None) -> None:
         criteria = self.get_criteria()
@@ -1602,7 +2263,12 @@ class FlightManagerApp:
 def main() -> None:
     root = Tk()
     ttk.Style().theme_use("clam")
-    app = FlightManagerApp(root)
+    try:
+        FlightManagerApp(root)
+    except DatabaseStartupError as exc:
+        messagebox.showerror("数据库无法打开", str(exc), parent=root)
+        root.destroy()
+        return
     root.mainloop()
 
 

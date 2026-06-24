@@ -5,10 +5,13 @@ A local Python desktop tool for managing airport flight route schedule data.
 ## Files
 
 - `airport_flight_schedule.xlsx`: original workbook source.
-- `flight_schedule.json`: converted local data file used by the app.
-- `reference_options.json`: local dropdown dictionaries for aircraft types, airlines, and countries/regions.
+- `flight_schedule.db`: SQLite database used by the app.
+- `flight_schedule.json`: legacy converted data file that can still be imported from the GUI.
+- `reference_options.json`: legacy dropdown dictionaries migrated into SQLite on first database creation.
 - `flight_manager.py`: Tkinter GUI for adding, searching, editing, deleting, and supplementing route records.
 - `test_flight_manager.py`: unit tests for import integrity, search, conflict detection, and JSON round-trip behavior.
+- `FrenchbeeFlightManager.spec`: PyInstaller build configuration for the Windows executable.
+- `frenchbee_flight_manager.ico`: desktop icon used by the app and executable.
 
 ## Run
 
@@ -16,11 +19,27 @@ A local Python desktop tool for managing airport flight route schedule data.
 python flight_manager.py
 ```
 
-The app only reads and writes `flight_schedule.json` locally.
+The app reads and writes `flight_schedule.db` locally. If the database is missing, it is created automatically from the bundled starter data.
+When migrating from an older JSON-based version, place the old `flight_schedule.json` next to the program before first launch, or use **从 JSON 导入旧数据** in the app. Blank fields in the JSON import will not overwrite existing completed database fields.
+
+## Build EXE
+
+Install PyInstaller in the Python environment you want to build with, then run:
+
+```powershell
+python -m PyInstaller FrenchbeeFlightManager.spec
+```
+
+The executable is created at `dist/FrenchbeeFlightManager.exe`. Keep `flight_schedule.db` next to the executable after first run; it is the user's editable local database.
 
 ## Main features
 
 - Add, edit, delete, and precisely search route records.
+- SQLite database storage with startup integrity checks and friendly database error messages.
+- Backup and restore the SQLite database from the main window.
+- Export the currently displayed routes to Excel `.xlsx` or CSV.
+- Import legacy `flight_schedule.json` records from the main window.
+- About window with software name, version, author, and GitHub link.
 - New records must include every required field before they can be saved.
 - Flight numbers must be unique and use a two-character airline code plus 1-4 digits.
 - Airline options include a required two-character code, which is automatically prefixed to outbound and return flight numbers.

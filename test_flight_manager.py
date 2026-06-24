@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import copy
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from flight_manager import (
-    DATA_FILE,
     HOUR_OPTIONS,
     MINUTE_OPTIONS,
-    REFERENCE_OPTIONS_FILE,
     TIME_OPTIONS,
     apply_airline_code_prefixes,
     blank_record,
@@ -20,6 +17,7 @@ from flight_manager import (
     find_time_conflicts,
     group_display_value,
     grouped_display_records,
+    import_json_records_to_database,
     load_data,
     load_reference_options,
     missing_fields,
@@ -33,13 +31,15 @@ from flight_manager import (
     strong_pair_candidates,
     sync_blank_pair_fields,
     validate_record,
+    write_csv,
+    write_xlsx,
 )
 
 
 class FlightScheduleDataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.data = load_data(DATA_FILE)
+        cls.data = load_data()
         cls.records = cls.data["records"]
 
     def test_imported_record_count(self) -> None:
@@ -248,7 +248,7 @@ class FlightScheduleDataTests(unittest.TestCase):
             validate_record({**record, "country_or_region": "A" * 51})
 
     def test_reference_options_include_current_sovereign_state_set(self) -> None:
-        options = load_reference_options(REFERENCE_OPTIONS_FILE)
+        options = load_reference_options()
         countries = options["countries_or_regions"]
         self.assertEqual(len(countries), 195)
         self.assertIn("airline_codes", options)
@@ -361,12 +361,67 @@ class FlightScheduleDataTests(unittest.TestCase):
 
     def test_save_and_reload_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "flight_schedule.json"
+            path = Path(temp_dir) / "flight_schedule.db"
             data = copy.deepcopy(self.data)
             save_data(data, path)
-            loaded = json.loads(path.read_text(encoding="utf-8"))
+            loaded = load_data(path)
             self.assertEqual(len(loaded["records"]), 86)
             self.assertEqual(loaded["records"][0]["airport_code"], self.records[0]["airport_code"])
+
+    def test_json_import_to_sqlite_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            json_path = Path(temp_dir) / "legacy.json"
+            db_path = Path(temp_dir) / "flight_schedule.db"
+            sample = {"schema_version": 1, "records": [self.records[0]]}
+            save_data(sample, json_path)
+            imported = import_json_records_to_database(json_path, db_path)
+            loaded = load_data(db_path)
+            self.assertEqual(imported, 1)
+            self.assertEqual(len(loaded["records"]), 1)
+            self.assertEqual(loaded["records"][0]["id"], self.records[0]["id"])
+
+    def test_json_import_preserves_existing_values_when_legacy_file_is_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            json_path = Path(temp_dir) / "legacy_blank.json"
+            db_path = Path(temp_dir) / "flight_schedule.db"
+            existing = {
+                **blank_record(),
+                "id": "route-existing",
+                "outbound_flight_no": "BF100",
+                "return_flight_no": "BF101",
+                "airport_code": "JFK",
+                "departure_time": "08:00",
+                "arrival_time": "20:00",
+                "aircraft_type": "A350",
+                "airline": "French bee",
+                "country_or_region": "USA",
+                "route_pair_id": "pair-existing",
+            }
+            blank_legacy = {
+                **blank_record(),
+                "id": "route-existing",
+                "airport_code": "JFK",
+                "departure_time": "08:00",
+                "arrival_time": "20:00",
+            }
+            save_data({"schema_version": 1, "records": [existing]}, db_path)
+            save_data({"schema_version": 1, "records": [blank_legacy]}, json_path)
+            import_json_records_to_database(json_path, db_path)
+            loaded = load_data(db_path)["records"][0]
+            self.assertEqual(loaded["outbound_flight_no"], "BF100")
+            self.assertEqual(loaded["aircraft_type"], "A350")
+            self.assertEqual(loaded["route_pair_id"], "pair-existing")
+
+    def test_csv_and_xlsx_exports_create_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            headers = ["航班号", "机场"]
+            rows = [["BF100", "JFK"]]
+            csv_path = Path(temp_dir) / "export.csv"
+            xlsx_path = Path(temp_dir) / "export.xlsx"
+            write_csv(csv_path, headers, rows)
+            write_xlsx(xlsx_path, headers, rows)
+            self.assertIn("BF100", csv_path.read_text(encoding="utf-8-sig"))
+            self.assertGreater(xlsx_path.stat().st_size, 1000)
 
 
 if __name__ == "__main__":
