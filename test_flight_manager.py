@@ -18,6 +18,8 @@ from flight_manager import (
     filter_options,
     find_duplicate_flight_numbers,
     find_time_conflicts,
+    group_display_value,
+    grouped_display_records,
     load_data,
     load_reference_options,
     missing_fields,
@@ -27,6 +29,7 @@ from flight_manager import (
     paired_group,
     route_info_complete,
     save_data,
+    sort_display_groups,
     strong_pair_candidates,
     sync_blank_pair_fields,
     validate_record,
@@ -81,6 +84,8 @@ class FlightScheduleDataTests(unittest.TestCase):
                 "airport_code": "JFK",
                 "departure_time": "08:00",
                 "arrival_time": "18:30",
+                "aircraft_type": "A350",
+                "airline": "French bee",
                 "country_or_region": "USA",
             },
             {
@@ -89,6 +94,8 @@ class FlightScheduleDataTests(unittest.TestCase):
                 "airport_code": "LAX",
                 "departure_time": "09:30",
                 "arrival_time": "21:00",
+                "aircraft_type": "A330",
+                "airline": "French bee",
                 "country_or_region": "USA",
             },
             {
@@ -97,11 +104,19 @@ class FlightScheduleDataTests(unittest.TestCase):
                 "airport_code": "ORY",
                 "departure_time": "08:30",
                 "arrival_time": "20:00",
+                "aircraft_type": "A350",
+                "airline": "Air France",
                 "country_or_region": "France",
             },
         ]
         country_matches = filter_records(records, {"country_or_region": "usa"})
         self.assertEqual([record["id"] for record in country_matches], ["early", "late"])
+
+        airline_matches = filter_records(records, {"airline": "french bee"})
+        self.assertEqual([record["id"] for record in airline_matches], ["early", "late"])
+
+        aircraft_matches = filter_records(records, {"aircraft_type": "a350"})
+        self.assertEqual([record["id"] for record in aircraft_matches], ["early", "other-country"])
 
         departure_range = filter_records(records, {"departure_start": "08:00", "departure_end": "09:00"})
         self.assertEqual([record["id"] for record in departure_range], ["early", "other-country"])
@@ -146,6 +161,31 @@ class FlightScheduleDataTests(unittest.TestCase):
         ]
         result = filter_records(records, {"flight_no": "FB100"})
         self.assertEqual([record["id"] for record in result], ["outbound", "return"])
+
+    def test_grouped_display_records_collapses_paired_routes(self) -> None:
+        records = [
+            {**blank_record(), "id": "outbound", "outbound_flight_no": "FB100", "route_pair_id": "pair-test"},
+            {**blank_record(), "id": "return", "return_flight_no": "FB101", "route_pair_id": "pair-test"},
+            {**blank_record(), "id": "single", "outbound_flight_no": "FB200"},
+        ]
+        groups = grouped_display_records(records)
+        self.assertEqual([[record["id"] for record in group] for group in groups], [["outbound", "return"], ["single"]])
+        self.assertEqual(group_display_value(groups[0], "outbound_flight_no"), "FB100")
+        self.assertEqual(group_display_value(groups[0], "return_flight_no"), "FB101")
+
+    def test_display_groups_sort_on_current_visible_rows(self) -> None:
+        groups = grouped_display_records(
+            [
+                {**blank_record(), "id": "a", "airport_code": "LAX", "route_pair_id": "pair-a"},
+                {**blank_record(), "id": "b", "airport_code": "LAX", "route_pair_id": "pair-a"},
+                {**blank_record(), "id": "c", "airport_code": "JFK"},
+            ]
+        )
+        ascending = sort_display_groups(groups, "airport_code", "asc")
+        self.assertEqual([group_display_value(group, "airport_code") for group in ascending], ["JFK", "LAX"])
+        descending = sort_display_groups(groups, "airport_code", "desc")
+        self.assertEqual([group_display_value(group, "airport_code") for group in descending], ["LAX", "JFK"])
+        self.assertIs(sort_display_groups(groups, "airport_code", None), groups)
 
     def test_complete_unpaired_record_requires_manual_pairing(self) -> None:
         record = {

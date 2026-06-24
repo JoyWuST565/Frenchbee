@@ -26,7 +26,8 @@ The app only reads and writes `flight_schedule.json` locally.
 - Airline options include a required two-character code, which is automatically prefixed to outbound and return flight numbers.
 - Airport codes must use three letters.
 - Outbound departure and return arrival times are selected with separate hour and five-minute interval dropdowns.
-- Search supports country/region filtering plus exact-time and time-range filters for outbound departure and return arrival.
+- Search supports airline, aircraft type, country/region filtering plus exact-time and time-range filters for outbound departure and return arrival.
+- The main table collapses associated outbound/return records into one displayed route and supports three-state header sorting: ascending, descending, and default order.
 - Aircraft type, airline, and country/region fields are searchable dropdowns; typed text only filters choices and must match an existing option to save.
 - Aircraft type and airline options are managed in local popups and are limited to 25 characters; countries/regions are limited to 50 characters and can also be renamed.
 - Warn when outbound departure or return arrival times are already occupied.

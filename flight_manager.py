@@ -346,6 +346,8 @@ def time_in_range(value: str, start: str, end: str) -> bool:
 def record_matches_criteria(record: dict[str, str], criteria: dict[str, str]) -> bool:
     flight_no = criteria.get("flight_no", "").strip().upper()
     airport_code = criteria.get("airport_code", "").strip().upper()
+    airline = criteria.get("airline", "").strip().casefold()
+    aircraft_type = criteria.get("aircraft_type", "").strip().casefold()
     country_or_region = criteria.get("country_or_region", "").strip().casefold()
     departure_time = normalize_search_time(criteria.get("departure_time", ""), "去程离港时间")
     arrival_time = normalize_search_time(criteria.get("arrival_time", ""), "返程抵港时间")
@@ -357,6 +359,10 @@ def record_matches_criteria(record: dict[str, str], criteria: dict[str, str]) ->
     if flight_no and flight_no not in {record.get("outbound_flight_no", "").upper(), record.get("return_flight_no", "").upper()}:
         return False
     if airport_code and airport_code != record.get("airport_code", "").upper():
+        return False
+    if airline and airline != record.get("airline", "").strip().casefold():
+        return False
+    if aircraft_type and aircraft_type != record.get("aircraft_type", "").strip().casefold():
         return False
     if country_or_region and country_or_region != record.get("country_or_region", "").strip().casefold():
         return False
@@ -392,6 +398,64 @@ def filter_records(records: list[dict[str, str]], criteria: dict[str, str]) -> l
     if not has_active_criteria(criteria):
         return matches
     return expand_associated_records(records, matches)
+
+
+def grouped_display_records(records: list[dict[str, str]]) -> list[list[dict[str, str]]]:
+    groups: list[list[dict[str, str]]] = []
+    seen_pairs: set[str] = set()
+    for record in records:
+        pair_id = record.get("route_pair_id", "")
+        if pair_id:
+            if pair_id in seen_pairs:
+                continue
+            seen_pairs.add(pair_id)
+            groups.append([item for item in records if item.get("route_pair_id") == pair_id])
+        else:
+            groups.append([record])
+    return groups
+
+
+def group_unique_values(group: list[dict[str, str]], field: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for record in group:
+        value = str(record.get(field, "")).strip()
+        key = value.casefold()
+        if value and key not in seen:
+            values.append(value)
+            seen.add(key)
+    return values
+
+
+def group_display_value(group: list[dict[str, str]], field: str) -> str:
+    if not group:
+        return ""
+    if field == "status":
+        if any(missing_fields(record) for record in group):
+            return "● 待补录"
+        if any(needs_pairing(record) for record in group):
+            return "● 待关联"
+        return "已关联" if any(record.get("route_pair_id") for record in group) else route_status(group[0])
+    if field == "route_pair_id":
+        return pair_display(group[0])
+    return " / ".join(group_unique_values(group, field))
+
+
+def group_row_id(group: list[dict[str, str]]) -> str:
+    pair_id = group[0].get("route_pair_id", "") if group else ""
+    if pair_id:
+        return f"pair:{pair_id}"
+    return f"record:{group[0].get('id', '')}" if group else "record:"
+
+
+def sort_display_groups(groups: list[list[dict[str, str]]], column: str | None, direction: str | None) -> list[list[dict[str, str]]]:
+    if not column or direction not in {"asc", "desc"}:
+        return groups
+    return sorted(
+        groups,
+        key=lambda group: (not group_display_value(group, column), group_display_value(group, column).casefold()),
+        reverse=direction == "desc",
+    )
 
 
 def paired_group(records: list[dict[str, str]], record: dict[str, str]) -> list[dict[str, str]]:
@@ -619,6 +683,7 @@ class OptionManagerDialog(Toplevel):
         self.app.options[self.category] = normalize_options(self.app.options.get(self.category, []), self.config_info["max_length"])
         save_reference_options(self.app.options)
         self.refresh()
+        self.app.refresh_search_option_combos()
         if self.on_change:
             self.on_change()
 
@@ -1026,9 +1091,12 @@ class FlightManagerApp:
         self.records: list[dict[str, str]] = self.data["records"]
         self.options = load_reference_options()
         self.current_results: list[dict[str, str]] = []
+        self.current_display_groups: list[list[dict[str, str]]] = []
         self.search_vars = {
             "flight_no": StringVar(),
             "airport_code": StringVar(),
+            "airline": StringVar(),
+            "aircraft_type": StringVar(),
             "country_or_region": StringVar(),
             "departure_time": StringVar(),
             "departure_start": StringVar(),
@@ -1037,8 +1105,13 @@ class FlightManagerApp:
             "arrival_start": StringVar(),
             "arrival_end": StringVar(),
         }
-        self.search_country_combo: ttk.Combobox | None = None
+        self.search_option_combos: dict[str, ttk.Combobox] = {}
         self.search_time_combos: list[ttk.Combobox] = []
+        self.table_row_records: dict[str, list[dict[str, str]]] = {}
+        self.record_to_row_id: dict[str, str] = {}
+        self.sort_column: str | None = None
+        self.sort_direction: str | None = None
+        self.table_headings: dict[str, str] = {}
         self.status_var = StringVar()
         self._build_ui()
         self.refresh()
@@ -1052,10 +1125,12 @@ class FlightManagerApp:
 
         search_inputs = ttk.Frame(search_frame)
         search_inputs.grid(row=0, column=0, sticky="w")
+        search_options = ttk.Frame(search_frame)
+        search_options.grid(row=1, column=0, sticky="w", pady=(8, 0))
         search_times = ttk.Frame(search_frame)
-        search_times.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        search_times.grid(row=2, column=0, sticky="w", pady=(8, 0))
         search_buttons = ttk.Frame(search_frame)
-        search_buttons.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        search_buttons.grid(row=3, column=0, sticky="w", pady=(8, 0))
         search_frame.columnconfigure(0, weight=1)
 
         for key, label_text, width in (
@@ -1067,18 +1142,9 @@ class FlightManagerApp:
             entry.pack(side=LEFT, padx=(0, 14))
             entry.bind("<Return>", lambda _event: self.apply_search())
 
-        ttk.Label(search_inputs, text="国家/地区").pack(side=LEFT, padx=(0, 6))
-        country_combo = ttk.Combobox(
-            search_inputs,
-            textvariable=self.search_vars["country_or_region"],
-            width=20,
-            values=filter_options(self.option_values_for_field("country_or_region"), "", limit=500),
-        )
-        country_combo.pack(side=LEFT, padx=(0, 14))
-        country_combo.bind("<KeyRelease>", lambda _event: self.filter_search_country_combo())
-        country_combo.bind("<Button-1>", lambda _event: self.filter_search_country_combo())
-        country_combo.bind("<Return>", lambda _event: self.apply_search())
-        self.search_country_combo = country_combo
+        self.add_search_option_combo(search_options, "航空公司", "airline", 20)
+        self.add_search_option_combo(search_options, "机型", "aircraft_type", 18)
+        self.add_search_option_combo(search_options, "国家/地区", "country_or_region", 20)
 
         self.add_search_time_combo(search_times, "去程离港", "departure_time")
         self.add_search_time_combo(search_times, "返程抵港", "arrival_time")
@@ -1121,10 +1187,9 @@ class FlightManagerApp:
             "airline",
             "country_or_region",
             "route_pair_id",
-            "source",
         )
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
-        headings = {
+        self.table_headings = {
             "status": "状态",
             "outbound_flight_no": "去程航班号",
             "return_flight_no": "返程航班号",
@@ -1132,10 +1197,9 @@ class FlightManagerApp:
             "departure_time": "去程离港",
             "arrival_time": "返程抵港",
             "aircraft_type": "机型",
-            "airline": "航司",
+            "airline": "航空公司",
             "country_or_region": "国家/地区",
             "route_pair_id": "关联ID",
-            "source": "来源",
         }
         widths = {
             "status": 95,
@@ -1145,14 +1209,13 @@ class FlightManagerApp:
             "departure_time": 70,
             "arrival_time": 70,
             "aircraft_type": 90,
-            "airline": 110,
+            "airline": 120,
             "country_or_region": 120,
             "route_pair_id": 95,
-            "source": 120,
         }
         for column in columns:
-            self.table.heading(column, text=headings[column])
-            self.table.column(column, width=widths[column], anchor="center", stretch=column in {"airline", "country_or_region", "source"})
+            self.table.heading(column, text=self.sort_heading_text(column), command=lambda item=column: self.toggle_sort(item))
+            self.table.column(column, width=widths[column], anchor="center", stretch=column in {"airline", "country_or_region"})
 
         yscroll = ttk.Scrollbar(table_frame, orient=VERTICAL, command=self.table.yview)
         self.table.configure(yscrollcommand=yscroll.set)
@@ -1184,6 +1247,43 @@ class FlightManagerApp:
         ttk.Label(status_bar, textvariable=self.status_var, foreground="#374151").pack(side=LEFT)
         ttk.Label(status_bar, text=f"数据文件：{DATA_FILE.name}", foreground="#6B7280").pack(side=RIGHT)
 
+    def sort_heading_text(self, column: str) -> str:
+        label = self.table_headings.get(column, column)
+        if self.sort_column != column:
+            return label
+        marker = " ↑" if self.sort_direction == "asc" else " ↓" if self.sort_direction == "desc" else ""
+        return f"{label}{marker}"
+
+    def update_sort_headings(self) -> None:
+        for column in self.table["columns"]:
+            self.table.heading(column, text=self.sort_heading_text(column), command=lambda item=column: self.toggle_sort(item))
+
+    def toggle_sort(self, column: str) -> None:
+        if self.sort_column != column:
+            self.sort_column = column
+            self.sort_direction = "asc"
+        elif self.sort_direction == "asc":
+            self.sort_direction = "desc"
+        else:
+            self.sort_column = None
+            self.sort_direction = None
+        self.update_sort_headings()
+        self.refresh()
+
+    def add_search_option_combo(self, parent: ttk.Frame, label_text: str, field: str, width: int) -> None:
+        ttk.Label(parent, text=label_text).pack(side=LEFT, padx=(0, 6))
+        combo = ttk.Combobox(
+            parent,
+            textvariable=self.search_vars[field],
+            width=width,
+            values=filter_options(self.option_values_for_field(field), "", limit=500),
+        )
+        combo.pack(side=LEFT, padx=(0, 14))
+        combo.bind("<KeyRelease>", lambda _event, item=field: self.filter_search_option_combo(item))
+        combo.bind("<Button-1>", lambda _event, item=field: self.filter_search_option_combo(item))
+        combo.bind("<Return>", lambda _event: self.apply_search())
+        self.search_option_combos[field] = combo
+
     def add_search_time_combo(self, parent: ttk.Frame, label_text: str, key: str) -> None:
         if label_text:
             ttk.Label(parent, text=label_text).pack(side=LEFT, padx=(0, 6))
@@ -1194,16 +1294,21 @@ class FlightManagerApp:
         combo.bind("<Return>", lambda _event: self.apply_search())
         self.search_time_combos.append(combo)
 
-    def filter_search_country_combo(self) -> None:
-        if self.search_country_combo is None:
+    def filter_search_option_combo(self, field: str) -> None:
+        combo = self.search_option_combos.get(field)
+        if combo is None:
             return
-        self.search_country_combo.configure(
+        combo.configure(
             values=filter_options(
-                self.option_values_for_field("country_or_region"),
-                self.search_country_combo.get(),
+                self.option_values_for_field(field),
+                combo.get(),
                 limit=500,
             )
         )
+
+    def refresh_search_option_combos(self) -> None:
+        for field in self.search_option_combos:
+            self.filter_search_option_combo(field)
 
     def filter_search_time_combo(self, combo: ttk.Combobox) -> None:
         combo.configure(values=filter_options(TIME_OPTIONS, combo.get(), limit=len(TIME_OPTIONS)))
@@ -1217,7 +1322,8 @@ class FlightManagerApp:
     def clear_search(self) -> None:
         for variable in self.search_vars.values():
             variable.set("")
-        self.filter_search_country_combo()
+        for field in self.search_option_combos:
+            self.filter_search_option_combo(field)
         for combo in self.search_time_combos:
             self.filter_search_time_combo(combo)
         self.refresh()
@@ -1249,33 +1355,48 @@ class FlightManagerApp:
     def refresh(self, select_id: str | None = None) -> None:
         criteria = self.get_criteria()
         self.current_results = filter_records(self.records, criteria)
+        self.current_display_groups = sort_display_groups(
+            grouped_display_records(self.current_results),
+            self.sort_column,
+            self.sort_direction,
+        )
+        self.table_row_records = {}
+        self.record_to_row_id = {}
         self.table.delete(*self.table.get_children())
-        for record in self.current_results:
-            missing = missing_fields(record)
-            status = route_status(record)
+        for group in self.current_display_groups:
+            row_id = group_row_id(group)
+            self.table_row_records[row_id] = group
+            for record in group:
+                self.record_to_row_id[record["id"]] = row_id
+            missing = any(missing_fields(record) for record in group)
+            pairing = any(needs_pairing(record) for record in group)
             values = (
-                status,
-                record.get("outbound_flight_no", ""),
-                record.get("return_flight_no", ""),
-                record.get("airport_code", ""),
-                record.get("departure_time", ""),
-                record.get("arrival_time", ""),
-                record.get("aircraft_type", ""),
-                record.get("airline", ""),
-                record.get("country_or_region", ""),
-                pair_display(record),
-                record.get("source", ""),
+                group_display_value(group, "status"),
+                group_display_value(group, "outbound_flight_no"),
+                group_display_value(group, "return_flight_no"),
+                group_display_value(group, "airport_code"),
+                group_display_value(group, "departure_time"),
+                group_display_value(group, "arrival_time"),
+                group_display_value(group, "aircraft_type"),
+                group_display_value(group, "airline"),
+                group_display_value(group, "country_or_region"),
+                group_display_value(group, "route_pair_id"),
             )
-            tag = "missing" if missing else "pairing" if needs_pairing(record) else "complete"
-            self.table.insert("", END, iid=record["id"], values=values, tags=(tag,))
+            tag = "missing" if missing else "pairing" if pairing else "complete"
+            self.table.insert("", END, iid=row_id, values=values, tags=(tag,))
         self.refresh_reminders()
-        if select_id and self.table.exists(select_id):
-            self.table.selection_set(select_id)
-            self.table.focus(select_id)
-            self.table.see(select_id)
+        if select_id:
+            row_id = self.record_to_row_id.get(select_id, select_id)
+            if self.table.exists(row_id):
+                self.table.selection_set(row_id)
+                self.table.focus(row_id)
+                self.table.see(row_id)
+        self.update_sort_headings()
         missing_count = sum(1 for record in self.records if missing_fields(record))
         pairing_count = sum(1 for record in self.records if needs_pairing(record))
-        self.status_var.set(f"共 {len(self.records)} 条记录，当前显示 {len(self.current_results)} 条，待补录 {missing_count} 条，待关联 {pairing_count} 条")
+        self.status_var.set(
+            f"共 {len(self.records)} 条数据记录，当前显示 {len(self.current_display_groups)} 条航线，待补录 {missing_count} 条，待关联 {pairing_count} 条"
+        )
 
     def refresh_reminders(self) -> None:
         self.reminders.delete(*self.reminders.get_children())
@@ -1297,7 +1418,10 @@ class FlightManagerApp:
         if not selected:
             messagebox.showinfo("请选择记录", "请先在主列表中选择一条航线记录。", parent=self.root)
             return None
-        record_id = selected[0]
+        group = self.table_row_records.get(selected[0], [])
+        if not group:
+            return None
+        record_id = group[0].get("id", "")
         return next((record for record in self.records if record.get("id") == record_id), None)
 
     def add_record(self) -> None:
@@ -1312,7 +1436,8 @@ class FlightManagerApp:
         record = next((item for item in self.records if item.get("id") == record_id), None)
         if not record:
             return
-        self.table.selection_set(record_id) if self.table.exists(record_id) else None
+        row_id = self.record_to_row_id.get(record_id)
+        self.table.selection_set(row_id) if row_id and self.table.exists(row_id) else None
         FlightEditor(self, record, focus_field=focus_field)
 
     def pair_selected(self) -> None:
