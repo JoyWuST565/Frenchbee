@@ -11,6 +11,7 @@ from flight_manager import (
     HOUR_OPTIONS,
     MINUTE_OPTIONS,
     REFERENCE_OPTIONS_FILE,
+    TIME_OPTIONS,
     apply_airline_code_prefixes,
     blank_record,
     filter_records,
@@ -69,8 +70,50 @@ class FlightScheduleDataTests(unittest.TestCase):
         }
         conflicts = find_time_conflicts(self.records, candidate)
         self.assertGreaterEqual(len(conflicts), 3)
-        self.assertIn("离港", {conflict["type"] for conflict in conflicts})
-        self.assertIn("到达", {conflict["type"] for conflict in conflicts})
+        self.assertIn("去程离港", {conflict["type"] for conflict in conflicts})
+        self.assertIn("返程抵港", {conflict["type"] for conflict in conflicts})
+
+    def test_query_by_country_or_region_and_time_ranges(self) -> None:
+        records = [
+            {
+                **blank_record(),
+                "id": "early",
+                "airport_code": "JFK",
+                "departure_time": "08:00",
+                "arrival_time": "18:30",
+                "country_or_region": "USA",
+            },
+            {
+                **blank_record(),
+                "id": "late",
+                "airport_code": "LAX",
+                "departure_time": "09:30",
+                "arrival_time": "21:00",
+                "country_or_region": "USA",
+            },
+            {
+                **blank_record(),
+                "id": "other-country",
+                "airport_code": "ORY",
+                "departure_time": "08:30",
+                "arrival_time": "20:00",
+                "country_or_region": "France",
+            },
+        ]
+        country_matches = filter_records(records, {"country_or_region": "usa"})
+        self.assertEqual([record["id"] for record in country_matches], ["early", "late"])
+
+        departure_range = filter_records(records, {"departure_start": "08:00", "departure_end": "09:00"})
+        self.assertEqual([record["id"] for record in departure_range], ["early", "other-country"])
+
+        arrival_range = filter_records(records, {"arrival_start": "20:00", "arrival_end": "21:00"})
+        self.assertEqual([record["id"] for record in arrival_range], ["late", "other-country"])
+
+        exact_and_range = filter_records(records, {"departure_time": "08:00", "departure_start": "08:00", "departure_end": "09:00"})
+        self.assertEqual([record["id"] for record in exact_and_range], ["early"])
+
+        with self.assertRaises(ValueError):
+            filter_records(records, {"departure_start": "10:00", "departure_end": "09:00"})
 
     def test_associated_record_is_included_in_precise_flight_query(self) -> None:
         records = [
@@ -190,13 +233,22 @@ class FlightScheduleDataTests(unittest.TestCase):
 
     def test_duplicate_flight_number_detection(self) -> None:
         existing = [
-            {**blank_record(), "id": "a", "outbound_flight_no": "BF101"},
+            {**blank_record(), "id": "a", "outbound_flight_no": "BF101", "route_pair_id": "pair-a"},
             {**blank_record(), "id": "b", "return_flight_no": "BF102"},
+            {**blank_record(), "id": "c", "return_flight_no": "BF101", "route_pair_id": "pair-a"},
         ]
         self.assertEqual(find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF103"}), [])
         duplicates = find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF101"})
         self.assertEqual(duplicates[0]["flight_no"], "BF101")
-        self.assertEqual(find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF101"}, exclude_id="a"), [])
+        self.assertEqual(
+            find_duplicate_flight_numbers(
+                existing,
+                {**blank_record(), "id": "a", "outbound_flight_no": "BF101", "route_pair_id": "pair-a"},
+                exclude_id="a",
+                exclude_pair_id="pair-a",
+            ),
+            [],
+        )
         same_record = find_duplicate_flight_numbers(existing, {**blank_record(), "outbound_flight_no": "BF200", "return_flight_no": "BF200"})
         self.assertEqual(same_record[0]["field"], "same_record")
 
@@ -208,6 +260,9 @@ class FlightScheduleDataTests(unittest.TestCase):
         self.assertEqual(HOUR_OPTIONS[0], "00")
         self.assertEqual(HOUR_OPTIONS[-1], "23")
         self.assertEqual(MINUTE_OPTIONS, ["00", "05", "10", "15", "20", "25", "30", "35", "40", "45", "50", "55"])
+        self.assertEqual(TIME_OPTIONS[0], "00:00")
+        self.assertEqual(TIME_OPTIONS[-1], "23:55")
+        self.assertEqual(len(TIME_OPTIONS), 288)
 
     def test_strong_pair_candidate_uses_same_airport_and_complementary_time(self) -> None:
         original = {

@@ -22,8 +22,8 @@ FIELD_LABELS = {
     "outbound_flight_no": "去程航班号",
     "return_flight_no": "返程航班号",
     "airport_code": "机场代码",
-    "departure_time": "离港时间",
-    "arrival_time": "到达时间",
+    "departure_time": "去程离港时间",
+    "arrival_time": "返程抵港时间",
     "aircraft_type": "机型",
     "country_or_region": "国家/地区",
 }
@@ -82,6 +82,7 @@ OPTION_FIELDS = {
 OPTION_CATEGORIES = {config["category"]: field for field, config in OPTION_FIELDS.items()}
 HOUR_OPTIONS = [f"{hour:02d}" for hour in range(24)]
 MINUTE_OPTIONS = [f"{minute:02d}" for minute in range(0, 60, 5)]
+TIME_OPTIONS = [f"{hour}:{minute}" for hour in HOUR_OPTIONS for minute in MINUTE_OPTIONS]
 
 
 def now_iso() -> str:
@@ -179,13 +180,14 @@ def save_reference_options(options: dict, path: Path = REFERENCE_OPTIONS_FILE) -
         raise
 
 
-def filter_options(values: list[str], term: str, limit: int = 80) -> list[str]:
+def filter_options(values: list[str], term: str, limit: int | None = 80) -> list[str]:
     term = term.strip().casefold()
     if not term:
-        return values[:limit]
+        return values[:] if limit is None else values[:limit]
     starts = [value for value in values if value.casefold().startswith(term)]
     contains = [value for value in values if term in value.casefold() and value not in starts]
-    return (starts + contains)[:limit]
+    results = starts + contains
+    return results if limit is None else results[:limit]
 
 
 def normalize_time(value: str) -> str:
@@ -283,7 +285,12 @@ def apply_airline_code_prefixes(record: dict[str, str], airline_codes: dict[str,
         record[field] = value
 
 
-def find_duplicate_flight_numbers(records: list[dict[str, str]], candidate: dict[str, str], exclude_id: str | None = None) -> list[dict[str, str]]:
+def find_duplicate_flight_numbers(
+    records: list[dict[str, str]],
+    candidate: dict[str, str],
+    exclude_id: str | None = None,
+    exclude_pair_id: str | None = None,
+) -> list[dict[str, str]]:
     candidate_numbers = [
         (field, candidate.get(field, "").strip().upper())
         for field in ("outbound_flight_no", "return_flight_no")
@@ -297,6 +304,8 @@ def find_duplicate_flight_numbers(records: list[dict[str, str]], candidate: dict
         for record in records:
             if exclude_id and record.get("id") == exclude_id:
                 continue
+            if exclude_pair_id and record.get("route_pair_id") == exclude_pair_id:
+                continue
             for existing_field in ("outbound_flight_no", "return_flight_no"):
                 if number == record.get(existing_field, "").strip().upper():
                     duplicates.append({"flight_no": number, "record": record, "field": existing_field, "candidate_field": field})
@@ -308,22 +317,56 @@ def record_summary(record: dict[str, str]) -> str:
     airport = record.get("airport_code") or "未录入机场"
     departure = record.get("departure_time") or "-"
     arrival = record.get("arrival_time") or "-"
-    return f"{flight_no} | {airport} | 离港 {departure} | 到达 {arrival}"
+    return f"{flight_no} | {airport} | 去程离港 {departure} | 返程抵港 {arrival}"
+
+
+def normalize_search_time(value: str, label: str) -> str:
+    if not str(value or "").strip():
+        return ""
+    time_value = normalize_time(value)
+    if time_value not in TIME_OPTIONS:
+        raise ValueError(f"{label}必须从 00:00 至 23:55、每 5 分钟一个间隔的下拉列表中选择。")
+    return time_value
+
+
+def time_in_range(value: str, start: str, end: str) -> bool:
+    if not start and not end:
+        return True
+    if not value:
+        return False
+    if start and end and start > end:
+        raise ValueError("时间段开始时间不能晚于结束时间。")
+    if start and value < start:
+        return False
+    if end and value > end:
+        return False
+    return True
 
 
 def record_matches_criteria(record: dict[str, str], criteria: dict[str, str]) -> bool:
     flight_no = criteria.get("flight_no", "").strip().upper()
     airport_code = criteria.get("airport_code", "").strip().upper()
-    departure_time = normalize_time(criteria.get("departure_time", ""))
-    arrival_time = normalize_time(criteria.get("arrival_time", ""))
+    country_or_region = criteria.get("country_or_region", "").strip().casefold()
+    departure_time = normalize_search_time(criteria.get("departure_time", ""), "去程离港时间")
+    arrival_time = normalize_search_time(criteria.get("arrival_time", ""), "返程抵港时间")
+    departure_start = normalize_search_time(criteria.get("departure_start", ""), "去程离港开始时间")
+    departure_end = normalize_search_time(criteria.get("departure_end", ""), "去程离港结束时间")
+    arrival_start = normalize_search_time(criteria.get("arrival_start", ""), "返程抵港开始时间")
+    arrival_end = normalize_search_time(criteria.get("arrival_end", ""), "返程抵港结束时间")
 
     if flight_no and flight_no not in {record.get("outbound_flight_no", "").upper(), record.get("return_flight_no", "").upper()}:
         return False
     if airport_code and airport_code != record.get("airport_code", "").upper():
         return False
+    if country_or_region and country_or_region != record.get("country_or_region", "").strip().casefold():
+        return False
     if departure_time and departure_time != record.get("departure_time", ""):
         return False
     if arrival_time and arrival_time != record.get("arrival_time", ""):
+        return False
+    if not time_in_range(record.get("departure_time", ""), departure_start, departure_end):
+        return False
+    if not time_in_range(record.get("arrival_time", ""), arrival_start, arrival_end):
         return False
     return True
 
@@ -402,9 +445,9 @@ def find_time_conflicts(records: list[dict[str, str]], candidate: dict[str, str]
         if exclude_id and record.get("id") == exclude_id:
             continue
         if departure_time and record.get("departure_time") == departure_time:
-            conflicts.append({"type": "离港", "time": departure_time, "record": record})
+            conflicts.append({"type": "去程离港", "time": departure_time, "record": record})
         if arrival_time and record.get("arrival_time") == arrival_time:
-            conflicts.append({"type": "到达", "time": arrival_time, "record": record})
+            conflicts.append({"type": "返程抵港", "time": arrival_time, "record": record})
     return conflicts
 
 
@@ -663,7 +706,7 @@ class FlightEditor(Toplevel):
         if self.original_id and self.app.get_counterparts(self.record):
             ttk.Label(
                 body,
-                text="该航线已有关联航班。修改后请同步检查对应的去程或回程航班。",
+                text="该航线已有关联航班。修改后请同步检查对应的去程或返程航班。",
                 foreground="#C2410C",
             ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
             row_offset = 1
@@ -740,7 +783,7 @@ class FlightEditor(Toplevel):
             parent,
             textvariable=variable,
             width=27,
-            values=filter_options(self.app.option_values_for_field(field), variable.get()),
+            values=filter_options(self.app.option_values_for_field(field), variable.get(), limit=500),
             validate="key",
             validatecommand=(self.register(lambda value, limit=config["max_length"]: len(value) <= limit), "%P"),
         )
@@ -758,7 +801,7 @@ class FlightEditor(Toplevel):
 
     def filter_option_combo(self, field: str) -> None:
         combo = self.option_combos[field]
-        combo.configure(values=filter_options(self.app.option_values_for_field(field), combo.get()))
+        combo.configure(values=filter_options(self.app.option_values_for_field(field), combo.get(), limit=500))
 
     def refresh_option_combos(self) -> None:
         for field in self.option_combos:
@@ -831,13 +874,18 @@ class FlightEditor(Toplevel):
                 "新增航线必须填写全部字段后才能保存。\n\n缺失：" + "、".join(FIELD_LABELS[field] for field in missing_fields(record)),
                 parent=self,
             )
-            self.entries[first_missing].focus_set()
+            self.focus_editor_field(first_missing)
             return
 
         if not self.original_id and route_info_complete(record) and not record.get("route_pair_id"):
             record["route_pair_id"] = new_pair_id()
 
-        duplicate_flights = find_duplicate_flight_numbers(self.app.records, record, exclude_id=self.original_id)
+        duplicate_flights = find_duplicate_flight_numbers(
+            self.app.records,
+            record,
+            exclude_id=self.original_id,
+            exclude_pair_id=record.get("route_pair_id", ""),
+        )
         if duplicate_flights:
             lines = []
             for duplicate in duplicate_flights[:8]:
@@ -879,7 +927,7 @@ class FlightEditor(Toplevel):
         if missing_fields(record):
             messagebox.showwarning("待补录提醒", "该航线仍有字段未录入，已在提醒区标记。", parent=self)
         elif needs_pairing(record):
-            messagebox.showwarning("待关联提醒", "该航线资料已完整，请继续手动关联对应的去程或回程航班。", parent=self)
+            messagebox.showwarning("待关联提醒", "该航线资料已完整，请继续手动关联对应的去程或返程航班。", parent=self)
         elif show_counterpart_prompt:
             self.app.show_counterpart_prompt(record["id"], parent=self)
         self.destroy()
@@ -893,7 +941,7 @@ class PairDialog(Toplevel):
         self.notice = notice
         self.same_airport_only = same_airport_only
         self.filter_text = StringVar()
-        self.title("关联去程/回程航班")
+        self.title("关联去程/返程航班")
         self.geometry("850x500")
         self.transient(app.root)
         self.grab_set()
@@ -962,7 +1010,7 @@ class PairDialog(Toplevel):
     def apply_pair(self) -> None:
         selected = self.candidates.selection()
         if not selected:
-            messagebox.showinfo("请选择候选航线", "请先选择要关联的去程或回程航班记录。", parent=self)
+            messagebox.showinfo("请选择候选航线", "请先选择要关联的去程或返程航班记录。", parent=self)
             return
         target_id = selected[0]
         if self.app.associate_records(self.source["id"], target_id, parent=self):
@@ -973,7 +1021,7 @@ class FlightManagerApp:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("航班航线本地管理")
-        self.root.geometry("1180x760")
+        self.root.geometry("1280x780")
         self.data = load_data()
         self.records: list[dict[str, str]] = self.data["records"]
         self.options = load_reference_options()
@@ -981,9 +1029,16 @@ class FlightManagerApp:
         self.search_vars = {
             "flight_no": StringVar(),
             "airport_code": StringVar(),
+            "country_or_region": StringVar(),
             "departure_time": StringVar(),
+            "departure_start": StringVar(),
+            "departure_end": StringVar(),
             "arrival_time": StringVar(),
+            "arrival_start": StringVar(),
+            "arrival_end": StringVar(),
         }
+        self.search_country_combo: ttk.Combobox | None = None
+        self.search_time_combos: list[ttk.Combobox] = []
         self.status_var = StringVar()
         self._build_ui()
         self.refresh()
@@ -995,25 +1050,57 @@ class FlightManagerApp:
         search_frame = ttk.LabelFrame(root_frame, text="精准查询", padding=10)
         search_frame.pack(fill=X)
 
-        search_fields = [
-            ("flight_no", "航班号"),
-            ("airport_code", "机场代码"),
-            ("departure_time", "离港时间"),
-            ("arrival_time", "到达时间"),
-        ]
-        for col, (key, label_text) in enumerate(search_fields):
-            ttk.Label(search_frame, text=label_text).grid(row=0, column=col * 2, sticky="e", padx=(0, 6))
-            entry = ttk.Entry(search_frame, textvariable=self.search_vars[key], width=14)
-            entry.grid(row=0, column=col * 2 + 1, sticky="w", padx=(0, 14))
+        search_inputs = ttk.Frame(search_frame)
+        search_inputs.grid(row=0, column=0, sticky="w")
+        search_times = ttk.Frame(search_frame)
+        search_times.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        search_buttons = ttk.Frame(search_frame)
+        search_buttons.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        search_frame.columnconfigure(0, weight=1)
+
+        for key, label_text, width in (
+            ("flight_no", "航班号", 14),
+            ("airport_code", "机场代码", 10),
+        ):
+            ttk.Label(search_inputs, text=label_text).pack(side=LEFT, padx=(0, 6))
+            entry = ttk.Entry(search_inputs, textvariable=self.search_vars[key], width=width)
+            entry.pack(side=LEFT, padx=(0, 14))
             entry.bind("<Return>", lambda _event: self.apply_search())
 
-        ttk.Button(search_frame, text="查询", command=self.apply_search).grid(row=0, column=8, padx=(4, 6))
-        ttk.Button(search_frame, text="清空", command=self.clear_search).grid(row=0, column=9, padx=(0, 6))
-        ttk.Button(search_frame, text="新增航线", command=self.add_record).grid(row=0, column=10, padx=(0, 6))
-        ttk.Button(search_frame, text="编辑选中", command=self.edit_selected).grid(row=0, column=11, padx=(0, 6))
-        ttk.Button(search_frame, text="关联选中", command=self.pair_selected).grid(row=0, column=12, padx=(0, 6))
-        ttk.Button(search_frame, text="取消关联", command=self.clear_selected_pair).grid(row=0, column=13, padx=(0, 6))
-        ttk.Button(search_frame, text="删除选中", command=self.delete_selected).grid(row=0, column=14)
+        ttk.Label(search_inputs, text="国家/地区").pack(side=LEFT, padx=(0, 6))
+        country_combo = ttk.Combobox(
+            search_inputs,
+            textvariable=self.search_vars["country_or_region"],
+            width=20,
+            values=filter_options(self.option_values_for_field("country_or_region"), "", limit=500),
+        )
+        country_combo.pack(side=LEFT, padx=(0, 14))
+        country_combo.bind("<KeyRelease>", lambda _event: self.filter_search_country_combo())
+        country_combo.bind("<Button-1>", lambda _event: self.filter_search_country_combo())
+        country_combo.bind("<Return>", lambda _event: self.apply_search())
+        self.search_country_combo = country_combo
+
+        self.add_search_time_combo(search_times, "去程离港", "departure_time")
+        self.add_search_time_combo(search_times, "返程抵港", "arrival_time")
+        ttk.Label(search_times, text="去程离港 从").pack(side=LEFT, padx=(8, 6))
+        self.add_search_time_combo(search_times, "", "departure_start")
+        ttk.Label(search_times, text="至").pack(side=LEFT, padx=(0, 6))
+        self.add_search_time_combo(search_times, "", "departure_end")
+        ttk.Label(search_times, text="返程抵港 从").pack(side=LEFT, padx=(8, 6))
+        self.add_search_time_combo(search_times, "", "arrival_start")
+        ttk.Label(search_times, text="至").pack(side=LEFT, padx=(0, 6))
+        self.add_search_time_combo(search_times, "", "arrival_end")
+
+        for text, command in (
+            ("查询", self.apply_search),
+            ("清空", self.clear_search),
+            ("新增航线", self.add_record),
+            ("编辑选中", self.edit_selected),
+            ("关联选中", self.pair_selected),
+            ("取消关联", self.clear_selected_pair),
+            ("删除选中", self.delete_selected),
+        ):
+            ttk.Button(search_buttons, text=text, command=command).pack(side=LEFT, padx=(0, 6))
 
         content = ttk.PanedWindow(root_frame, orient="horizontal")
         content.pack(fill=BOTH, expand=True, pady=(12, 8))
@@ -1042,8 +1129,8 @@ class FlightManagerApp:
             "outbound_flight_no": "去程航班号",
             "return_flight_no": "返程航班号",
             "airport_code": "机场",
-            "departure_time": "离港",
-            "arrival_time": "到达",
+            "departure_time": "去程离港",
+            "arrival_time": "返程抵港",
             "aircraft_type": "机型",
             "airline": "航司",
             "country_or_region": "国家/地区",
@@ -1097,6 +1184,30 @@ class FlightManagerApp:
         ttk.Label(status_bar, textvariable=self.status_var, foreground="#374151").pack(side=LEFT)
         ttk.Label(status_bar, text=f"数据文件：{DATA_FILE.name}", foreground="#6B7280").pack(side=RIGHT)
 
+    def add_search_time_combo(self, parent: ttk.Frame, label_text: str, key: str) -> None:
+        if label_text:
+            ttk.Label(parent, text=label_text).pack(side=LEFT, padx=(0, 6))
+        combo = ttk.Combobox(parent, textvariable=self.search_vars[key], width=7, values=TIME_OPTIONS)
+        combo.pack(side=LEFT, padx=(0, 8))
+        combo.bind("<KeyRelease>", lambda _event, item=combo: self.filter_search_time_combo(item))
+        combo.bind("<Button-1>", lambda _event, item=combo: self.filter_search_time_combo(item))
+        combo.bind("<Return>", lambda _event: self.apply_search())
+        self.search_time_combos.append(combo)
+
+    def filter_search_country_combo(self) -> None:
+        if self.search_country_combo is None:
+            return
+        self.search_country_combo.configure(
+            values=filter_options(
+                self.option_values_for_field("country_or_region"),
+                self.search_country_combo.get(),
+                limit=500,
+            )
+        )
+
+    def filter_search_time_combo(self, combo: ttk.Combobox) -> None:
+        combo.configure(values=filter_options(TIME_OPTIONS, combo.get(), limit=len(TIME_OPTIONS)))
+
     def apply_search(self) -> None:
         try:
             self.refresh()
@@ -1106,6 +1217,9 @@ class FlightManagerApp:
     def clear_search(self) -> None:
         for variable in self.search_vars.values():
             variable.set("")
+        self.filter_search_country_combo()
+        for combo in self.search_time_combos:
+            self.filter_search_time_combo(combo)
         self.refresh()
 
     def get_criteria(self) -> dict[str, str]:
@@ -1171,7 +1285,7 @@ class FlightManagerApp:
                 labels = "缺失：" + "、".join(FIELD_LABELS[field] for field in missing)
                 self.reminders.insert("", END, iid=record["id"], values=(record_summary(record), labels), tags=("missing",))
             elif needs_pairing(record):
-                self.reminders.insert("", END, iid=record["id"], values=(record_summary(record), "需关联去程/回程航班"), tags=("pairing",))
+                self.reminders.insert("", END, iid=record["id"], values=(record_summary(record), "需关联去程/返程航班"), tags=("pairing",))
 
     def persist_and_refresh(self, select_id: str | None = None) -> None:
         self.data["records"] = self.records
@@ -1208,10 +1322,10 @@ class FlightManagerApp:
 
     def open_pair_dialog(self, record: dict[str, str]) -> None:
         if missing_fields(record):
-            messagebox.showwarning("请先补录", "该航线仍有必填信息未录入，请补录完整后再关联去程或回程航班。", parent=self.root)
+            messagebox.showwarning("请先补录", "该航线仍有必填信息未录入，请补录完整后再关联去程或返程航班。", parent=self.root)
             FlightEditor(self, record, focus_field=missing_fields(record)[0])
             return
-        PairDialog(self, record, notice="请从机场代码相同的现有航班中选择对应的去程或回程航班。")
+        PairDialog(self, record, notice="请从机场代码相同的现有航班中选择对应的去程或返程航班。")
 
     def try_auto_pair_existing(self, record_id: str, original_record: dict[str, str]) -> None:
         record = next((item for item in self.records if item.get("id") == record_id), None)
@@ -1222,14 +1336,14 @@ class FlightManagerApp:
             self.associate_records(record_id, candidates[0]["id"], show_message=False)
             messagebox.showinfo(
                 "已自动关联",
-                "已根据机场代码和补录的对应起降时间，将该航班与现有单程记录关联，并同步补齐对方空白字段。",
+                "已根据机场代码和补录的对应去程离港/返程抵港时间，将该航班与现有单程记录关联，并同步补齐对方空白字段。",
                 parent=self.root,
             )
             return
         if len(candidates) > 1:
-            notice = "找到多个同机场、同对应时间的候选航班，请手动选择要关联的去程或回程航班。"
+            notice = "找到多个同机场、同对应时间的候选航班，请手动选择要关联的去程或返程航班。"
         else:
-            notice = "未找到唯一的自动匹配项。请从机场代码相同的现有航班中手动选择对应的去程或回程航班。"
+            notice = "未找到唯一的自动匹配项。请从机场代码相同的现有航班中手动选择对应的去程或返程航班。"
         PairDialog(self, record, notice=notice)
 
     def get_counterparts(self, record: dict[str, str]) -> list[dict[str, str]]:
@@ -1241,7 +1355,7 @@ class FlightManagerApp:
             return
         counterparts = self.get_counterparts(record)
         if not counterparts:
-            messagebox.showinfo("暂无对应航班", "该记录当前没有可跳转的对应去程或回程航班。", parent=parent or self.root)
+            messagebox.showinfo("暂无对应航班", "该记录当前没有可跳转的对应去程或返程航班。", parent=parent or self.root)
             return
         if len(counterparts) > 1:
             messagebox.showinfo("存在多个关联记录", "该关联组存在多条对应记录，将打开第一条；也可在主列表中逐条选择编辑。", parent=parent or self.root)
@@ -1259,7 +1373,7 @@ class FlightManagerApp:
 
         body = ttk.Frame(prompt, padding=16)
         body.pack(fill=BOTH, expand=True)
-        ttk.Label(body, text="该航线已保存。请同步检查并修改其对应的去程或回程航班。", foreground="#C2410C", wraplength=360).pack(anchor="w", pady=(0, 10))
+        ttk.Label(body, text="该航线已保存。请同步检查并修改其对应的去程或返程航班。", foreground="#C2410C", wraplength=360).pack(anchor="w", pady=(0, 10))
         ttk.Label(body, text=record_summary(record), wraplength=360).pack(anchor="w", pady=(0, 12))
         button_bar = ttk.Frame(body)
         button_bar.pack(fill=X)
@@ -1273,7 +1387,7 @@ class FlightManagerApp:
             messagebox.showerror("关联失败", "未找到需要关联的航线记录。", parent=parent or self.root)
             return False
         if source.get("airport_code") != target.get("airport_code"):
-            messagebox.showerror("关联失败", "仅允许关联机场代码相同的去程/回程航班。", parent=parent or self.root)
+            messagebox.showerror("关联失败", "仅允许关联机场代码相同的去程/返程航班。", parent=parent or self.root)
             return False
         source_pair = source.get("route_pair_id", "")
         target_pair = target.get("route_pair_id", "")
@@ -1298,7 +1412,7 @@ class FlightManagerApp:
         sync_blank_pair_fields(source, target)
         self.persist_and_refresh(select_id=source_id)
         if show_message:
-            messagebox.showinfo("关联完成", "已关联所选去程/回程航班，并同步补齐对方空白字段。检索其中任一航班时，对应航班也会一起显示。", parent=parent or self.root)
+            messagebox.showinfo("关联完成", "已关联所选去程/返程航班，并同步补齐对方空白字段。检索其中任一航班时，对应航班也会一起显示。", parent=parent or self.root)
         return True
 
     def clear_selected_pair(self) -> None:
@@ -1330,14 +1444,14 @@ class FlightManagerApp:
         if not group:
             messagebox.showwarning(
                 "不允许单独删除",
-                "该记录尚未关联对应的去程或回程航班。系统只允许删除一对往返航班，请先完成关联后再删除。",
+                "该记录尚未关联对应的去程或返程航班。系统只允许删除一对往返航班，请先完成关联后再删除。",
                 parent=self.root,
             )
             return
         lines = "\n".join(f"- {record_summary(item)}" for item in group)
         if not messagebox.askyesno(
             "确认删除往返航班",
-            "删除操作将一并删除该关联组内的去程/回程航班，不允许仅删除其中任一单个航班。\n\n"
+            "删除操作将一并删除该关联组内的去程/返程航班，不允许仅删除其中任一单个航班。\n\n"
             f"将删除 {len(group)} 条记录：\n{lines}\n\n是否一键删除整组？",
             default=messagebox.NO,
             parent=self.root,
