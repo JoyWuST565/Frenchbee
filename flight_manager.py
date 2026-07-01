@@ -40,10 +40,11 @@ def load_tkinter_runtime():
     ttk_module = importlib.import_module("tkinter.ttk")
     filedialog_module = importlib.import_module("tkinter.filedialog")
     messagebox_module = importlib.import_module("tkinter.messagebox")
-    return tk_module, ttk_module, filedialog_module, messagebox_module
+    simpledialog_module = importlib.import_module("tkinter.simpledialog")
+    return tk_module, ttk_module, filedialog_module, messagebox_module, simpledialog_module
 
 
-tk, ttk, filedialog, messagebox = load_tkinter_runtime()
+tk, ttk, filedialog, messagebox, simpledialog = load_tkinter_runtime()
 BOTH = tk.BOTH
 END = tk.END
 LEFT = tk.LEFT
@@ -60,8 +61,8 @@ Tk = tk.Tk
 Toplevel = tk.Toplevel
 
 
-APP_NAME = "Frenchbee Flight Manager"
-APP_DISPLAY_NAME = "Frenchbee 航班航线管理"
+APP_NAME = "Flight Route Management Program"
+APP_DISPLAY_NAME = "航班航线管理程序"
 APP_VERSION = "1.2.0"
 APP_AUTHOR = "JoyWuST565"
 GITHUB_URL = "https://github.com/JoyWuST565/Frenchbee"
@@ -75,9 +76,12 @@ DATA_FILE = RUNTIME_DATA_FILE if RUNTIME_DATA_FILE.exists() else BUNDLED_DATA_FI
 RUNTIME_REFERENCE_OPTIONS_FILE = APP_DIR / "reference_options.json"
 BUNDLED_REFERENCE_OPTIONS_FILE = RESOURCE_DIR / "reference_options.json"
 REFERENCE_OPTIONS_FILE = RUNTIME_REFERENCE_OPTIONS_FILE if RUNTIME_REFERENCE_OPTIONS_FILE.exists() else BUNDLED_REFERENCE_OPTIONS_FILE
-APP_ICON_FILE = RESOURCE_DIR / "frenchbee_flight_manager.ico"
+APP_ICON_FILE = RESOURCE_DIR / "flight_route_manager.ico"
 SCHEMA_VERSION = 1
 DATABASE_SCHEMA_VERSION = 1
+DEFAULT_COMPANY_ID = "company-default"
+DEFAULT_COMPANY_NAME = "默认母公司"
+COMPANY_NAME_MAX_LENGTH = 50
 THEME_MODES = ("light", "dark")
 TABLE_ZOOM_MIN = 80
 TABLE_ZOOM_MAX = 140
@@ -86,6 +90,8 @@ DEFAULT_UI_SETTINGS = {
     "theme_mode": "light",
     "hidden_columns": "[]",
     "table_zoom": "100",
+    "remember_login": "0",
+    "current_company_id": "",
 }
 SUPPLEMENTARY_FIELDS = (
     "outbound_flight_no",
@@ -97,7 +103,7 @@ SUPPLEMENTARY_FIELDS = (
 )
 
 FIELD_LABELS = {
-    "airline": "航司",
+    "airline": "子公司",
     "outbound_flight_no": "去程航班号",
     "return_flight_no": "返程航班号",
     "airport_code": "机场代码",
@@ -151,7 +157,7 @@ DISPLAY_HEADINGS = {
     "departure_time": "去程离港",
     "arrival_time": "返程抵港",
     "aircraft_type": "机型",
-    "airline": "航空公司",
+    "airline": "子公司",
     "country_or_region": "国家/地区",
     "route_pair_id": "关联ID",
 }
@@ -221,7 +227,7 @@ OPTION_FIELDS = {
     },
     "airline": {
         "category": "airlines",
-        "label": "航司",
+        "label": "子公司",
         "max_length": 25,
         "allow_rename": True,
     },
@@ -283,7 +289,7 @@ def normalize_airline_code(value: str) -> str:
     if not code:
         return ""
     if not AIRLINE_CODE_RE.fullmatch(code):
-        raise ValueError("航司二字代码必须由两位大写英文字母或阿拉伯数字组成，例如 BF、9C、G5、23。")
+        raise ValueError("子公司二字代码必须由两位大写英文字母或阿拉伯数字组成，例如 BF、9C、G5、23。")
     return code
 
 
@@ -354,13 +360,20 @@ def connect_database(path: Path = DB_FILE) -> sqlite3.Connection:
 
 def create_database_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS flights (
+        CREATE TABLE IF NOT EXISTS companies (
             id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS flights (
+            company_id TEXT NOT NULL DEFAULT '{DEFAULT_COMPANY_ID}',
+            id TEXT NOT NULL,
             outbound_flight_no TEXT NOT NULL DEFAULT '',
             return_flight_no TEXT NOT NULL DEFAULT '',
             airport_code TEXT NOT NULL DEFAULT '',
@@ -372,14 +385,16 @@ def create_database_schema(connection: sqlite3.Connection) -> None:
             route_pair_id TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT 'manual',
             updated_at TEXT NOT NULL DEFAULT '',
-            display_order INTEGER NOT NULL DEFAULT 0
+            display_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (company_id, id)
         );
         CREATE TABLE IF NOT EXISTS reference_options (
+            company_id TEXT NOT NULL DEFAULT '{DEFAULT_COMPANY_ID}',
             category TEXT NOT NULL,
             value TEXT NOT NULL,
             airline_code TEXT NOT NULL DEFAULT '',
             display_order INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (category, value)
+            PRIMARY KEY (company_id, category, value)
         );
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -396,6 +411,160 @@ def create_database_schema(connection: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO app_settings(key, value) VALUES(?, ?)",
             (key, value),
         )
+    migrate_company_schema(connection)
+
+
+def sql_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def table_columns(connection: sqlite3.Connection, table_name: str) -> list[str]:
+    return [row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})")]
+
+
+def primary_key_columns(connection: sqlite3.Connection, table_name: str) -> list[str]:
+    rows = list(connection.execute(f"PRAGMA table_info({table_name})"))
+    return [row["name"] for row in sorted((row for row in rows if row["pk"]), key=lambda item: item["pk"])]
+
+
+def insert_default_company(connection: sqlite3.Connection) -> None:
+    initialized = connection.execute("SELECT value FROM metadata WHERE key = 'companies_initialized'").fetchone()
+    company_count = connection.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+    if initialized and company_count == 0:
+        return
+    timestamp = now_iso()
+    if company_count == 0:
+        connection.execute(
+            "INSERT OR IGNORE INTO companies(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (DEFAULT_COMPANY_ID, DEFAULT_COMPANY_NAME, timestamp, timestamp),
+        )
+    connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES('companies_initialized', '1')")
+
+
+def migrate_company_schema(connection: sqlite3.Connection) -> None:
+    insert_default_company(connection)
+    migrate_flights_company_schema(connection)
+    migrate_reference_options_company_schema(connection)
+
+
+def migrate_flights_company_schema(connection: sqlite3.Connection) -> None:
+    columns = table_columns(connection, "flights")
+    pk_columns = primary_key_columns(connection, "flights")
+    if "company_id" in columns and pk_columns == ["company_id", "id"]:
+        connection.execute(
+            "UPDATE flights SET company_id = ? WHERE company_id = '' OR company_id IS NULL",
+            (DEFAULT_COMPANY_ID,),
+        )
+        return
+
+    legacy_table = f"flights_legacy_{uuid.uuid4().hex[:8]}"
+    connection.execute(f"ALTER TABLE flights RENAME TO {legacy_table}")
+    connection.executescript(
+        f"""
+        CREATE TABLE flights (
+            company_id TEXT NOT NULL DEFAULT '{DEFAULT_COMPANY_ID}',
+            id TEXT NOT NULL,
+            outbound_flight_no TEXT NOT NULL DEFAULT '',
+            return_flight_no TEXT NOT NULL DEFAULT '',
+            airport_code TEXT NOT NULL DEFAULT '',
+            departure_time TEXT NOT NULL DEFAULT '',
+            arrival_time TEXT NOT NULL DEFAULT '',
+            aircraft_type TEXT NOT NULL DEFAULT '',
+            airline TEXT NOT NULL DEFAULT '',
+            country_or_region TEXT NOT NULL DEFAULT '',
+            route_pair_id TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            updated_at TEXT NOT NULL DEFAULT '',
+            display_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (company_id, id)
+        );
+        """
+    )
+    legacy_columns = table_columns(connection, legacy_table)
+
+    def expr(column: str, default: str = "") -> str:
+        return column if column in legacy_columns else sql_literal(default)
+
+    company_expr = (
+        f"COALESCE(NULLIF(company_id, ''), {sql_literal(DEFAULT_COMPANY_ID)})"
+        if "company_id" in legacy_columns
+        else sql_literal(DEFAULT_COMPANY_ID)
+    )
+    connection.execute(
+        f"""
+        INSERT OR IGNORE INTO flights(
+            company_id, id, outbound_flight_no, return_flight_no, airport_code,
+            departure_time, arrival_time, aircraft_type, airline, country_or_region,
+            route_pair_id, source, updated_at, display_order
+        )
+        SELECT
+            {company_expr},
+            {expr("id")},
+            {expr("outbound_flight_no")},
+            {expr("return_flight_no")},
+            {expr("airport_code")},
+            {expr("departure_time")},
+            {expr("arrival_time")},
+            {expr("aircraft_type")},
+            {expr("airline")},
+            {expr("country_or_region")},
+            {expr("route_pair_id")},
+            {expr("source", "manual")},
+            {expr("updated_at")},
+            {expr("display_order", "0")}
+        FROM {legacy_table}
+        """
+    )
+    connection.execute(f"DROP TABLE {legacy_table}")
+
+
+def migrate_reference_options_company_schema(connection: sqlite3.Connection) -> None:
+    columns = table_columns(connection, "reference_options")
+    pk_columns = primary_key_columns(connection, "reference_options")
+    if "company_id" in columns and pk_columns == ["company_id", "category", "value"]:
+        connection.execute(
+            "UPDATE reference_options SET company_id = ? WHERE company_id = '' OR company_id IS NULL",
+            (DEFAULT_COMPANY_ID,),
+        )
+        return
+
+    legacy_table = f"reference_options_legacy_{uuid.uuid4().hex[:8]}"
+    connection.execute(f"ALTER TABLE reference_options RENAME TO {legacy_table}")
+    connection.executescript(
+        f"""
+        CREATE TABLE reference_options (
+            company_id TEXT NOT NULL DEFAULT '{DEFAULT_COMPANY_ID}',
+            category TEXT NOT NULL,
+            value TEXT NOT NULL,
+            airline_code TEXT NOT NULL DEFAULT '',
+            display_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (company_id, category, value)
+        );
+        """
+    )
+    legacy_columns = table_columns(connection, legacy_table)
+
+    def expr(column: str, default: str = "") -> str:
+        return column if column in legacy_columns else sql_literal(default)
+
+    company_expr = (
+        f"COALESCE(NULLIF(company_id, ''), {sql_literal(DEFAULT_COMPANY_ID)})"
+        if "company_id" in legacy_columns
+        else sql_literal(DEFAULT_COMPANY_ID)
+    )
+    connection.execute(
+        f"""
+        INSERT OR IGNORE INTO reference_options(company_id, category, value, airline_code, display_order)
+        SELECT
+            {company_expr},
+            {expr("category")},
+            {expr("value")},
+            {expr("airline_code")},
+            {expr("display_order", "0")}
+        FROM {legacy_table}
+        """
+    )
+    connection.execute(f"DROP TABLE {legacy_table}")
 
 
 def check_database_integrity(path: Path = DB_FILE) -> None:
@@ -452,20 +621,20 @@ def save_json_data(data: dict, path: Path) -> None:
         raise
 
 
-def write_records_to_database(connection: sqlite3.Connection, records: list[dict[str, str]]) -> None:
-    connection.execute("DELETE FROM flights")
+def write_records_to_database(connection: sqlite3.Connection, records: list[dict[str, str]], company_id: str = DEFAULT_COMPANY_ID) -> None:
+    connection.execute("DELETE FROM flights WHERE company_id = ?", (company_id,))
     for index, record in enumerate(records):
         normalized = normalize_record(record)
         connection.execute(
             """
             INSERT INTO flights(
-                id, outbound_flight_no, return_flight_no, airport_code, departure_time,
+                company_id, id, outbound_flight_no, return_flight_no, airport_code, departure_time,
                 arrival_time, aircraft_type, airline, country_or_region, route_pair_id,
                 source, updated_at, display_order
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            tuple(normalized[field] for field in DATA_FIELDS) + (index,),
+            (company_id,) + tuple(normalized[field] for field in DATA_FIELDS) + (index,),
         )
 
 
@@ -492,12 +661,17 @@ def merge_import_record(existing: dict[str, str] | None, incoming: dict[str, str
     return normalize_record(merged)
 
 
-def upsert_records_to_database(connection: sqlite3.Connection, records: list[dict[str, str]], preserve_existing_on_blank: bool = False) -> int:
-    max_order = connection.execute("SELECT COALESCE(MAX(display_order), -1) FROM flights").fetchone()[0]
+def upsert_records_to_database(
+    connection: sqlite3.Connection,
+    records: list[dict[str, str]],
+    preserve_existing_on_blank: bool = False,
+    company_id: str = DEFAULT_COMPANY_ID,
+) -> int:
+    max_order = connection.execute("SELECT COALESCE(MAX(display_order), -1) FROM flights WHERE company_id = ?", (company_id,)).fetchone()[0]
     imported = 0
     for offset, record in enumerate(records, start=1):
         normalized = normalize_record(record)
-        current = connection.execute("SELECT * FROM flights WHERE id = ?", (normalized["id"],)).fetchone()
+        current = connection.execute("SELECT * FROM flights WHERE company_id = ? AND id = ?", (company_id, normalized["id"])).fetchone()
         current_order = current["display_order"] if current else None
         if preserve_existing_on_blank and current:
             normalized = merge_import_record(dict(current), normalized)
@@ -505,12 +679,12 @@ def upsert_records_to_database(connection: sqlite3.Connection, records: list[dic
         connection.execute(
             """
             INSERT INTO flights(
-                id, outbound_flight_no, return_flight_no, airport_code, departure_time,
+                company_id, id, outbound_flight_no, return_flight_no, airport_code, departure_time,
                 arrival_time, aircraft_type, airline, country_or_region, route_pair_id,
                 source, updated_at, display_order
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(company_id, id) DO UPDATE SET
                 outbound_flight_no=excluded.outbound_flight_no,
                 return_flight_no=excluded.return_flight_no,
                 airport_code=excluded.airport_code,
@@ -524,31 +698,36 @@ def upsert_records_to_database(connection: sqlite3.Connection, records: list[dic
                 updated_at=excluded.updated_at,
                 display_order=excluded.display_order
             """,
-            tuple(normalized[field] for field in DATA_FIELDS) + (display_order,),
+            (company_id,) + tuple(normalized[field] for field in DATA_FIELDS) + (display_order,),
         )
         imported += 1
     return imported
 
 
-def write_reference_options_to_database(connection: sqlite3.Connection, options: dict) -> None:
+def write_reference_options_to_database(connection: sqlite3.Connection, options: dict, company_id: str = DEFAULT_COMPANY_ID) -> None:
     payload = normalized_reference_payload(options)
-    connection.execute("DELETE FROM reference_options")
+    connection.execute("DELETE FROM reference_options WHERE company_id = ?", (company_id,))
     airline_codes = payload.get("airline_codes", {})
     for field, config in OPTION_FIELDS.items():
         category = config["category"]
         for index, value in enumerate(payload.get(category, [])):
             connection.execute(
-                "INSERT INTO reference_options(category, value, airline_code, display_order) VALUES (?, ?, ?, ?)",
-                (category, value, airline_codes.get(value, "") if field == "airline" else "", index),
+                "INSERT INTO reference_options(company_id, category, value, airline_code, display_order) VALUES (?, ?, ?, ?, ?)",
+                (company_id, category, value, airline_codes.get(value, "") if field == "airline" else "", index),
             )
 
 
-def create_database_from_payload(path: Path, data: dict | None = None, options: dict | None = None) -> None:
+def create_database_from_payload(
+    path: Path,
+    data: dict | None = None,
+    options: dict | None = None,
+    company_id: str = DEFAULT_COMPANY_ID,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect_database(path)) as connection:
         create_database_schema(connection)
-        write_records_to_database(connection, (data or {}).get("records", []))
-        write_reference_options_to_database(connection, options or {})
+        write_records_to_database(connection, (data or {}).get("records", []), company_id)
+        write_reference_options_to_database(connection, options or {}, company_id)
         for key in ("schema_version", "generated_from", "generated_at"):
             value = str((data or {}).get(key, SCHEMA_VERSION if key == "schema_version" else ""))
             connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", (key, value))
@@ -596,7 +775,7 @@ def maybe_import_runtime_legacy_json(path: Path = DB_FILE) -> int:
     if useful_legacy_field_count(data.get("records", [])) == 0:
         return 0
     with closing(connect_database(path)) as connection:
-        imported = upsert_records_to_database(connection, data.get("records", []), preserve_existing_on_blank=True)
+        imported = upsert_records_to_database(connection, data.get("records", []), preserve_existing_on_blank=True, company_id=DEFAULT_COMPANY_ID)
         connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", ("legacy_json_imported_from", str(RUNTIME_DATA_FILE)))
         connection.commit()
     return imported
@@ -604,10 +783,10 @@ def maybe_import_runtime_legacy_json(path: Path = DB_FILE) -> int:
 
 def ensure_database(path: Path = DB_FILE) -> None:
     if path.exists():
-        check_database_integrity(path)
         with closing(connect_database(path)) as connection:
             create_database_schema(connection)
             connection.commit()
+        check_database_integrity(path)
         maybe_import_runtime_legacy_json(path)
         return
     is_primary_database = path.resolve() == DB_FILE.resolve()
@@ -628,14 +807,133 @@ def ensure_database(path: Path = DB_FILE) -> None:
     check_database_integrity(path)
 
 
-def load_reference_options(path: Path = DB_FILE) -> dict:
+def normalize_company_name(value: str) -> str:
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("母公司名称不能为空。")
+    if len(name) > COMPANY_NAME_MAX_LENGTH:
+        raise ValueError(f"母公司名称不能超过 {COMPANY_NAME_MAX_LENGTH} 个字符。")
+    return name
+
+
+def load_companies(path: Path = DB_FILE) -> list[dict[str, str]]:
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        rows = list(connection.execute("SELECT id, name, created_at, updated_at FROM companies ORDER BY name COLLATE NOCASE"))
+    return [dict(row) for row in rows]
+
+
+def get_company_by_id(company_id: str, path: Path = DB_FILE) -> dict[str, str] | None:
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        row = connection.execute("SELECT id, name, created_at, updated_at FROM companies WHERE id = ?", (company_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def find_company_by_name(name: str, path: Path = DB_FILE) -> dict[str, str] | None:
+    normalized = normalize_company_name(name)
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        row = connection.execute(
+            "SELECT id, name, created_at, updated_at FROM companies WHERE lower(name) = lower(?)",
+            (normalized,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def seed_reference_options_for_company(connection: sqlite3.Connection, company_id: str) -> None:
+    existing = connection.execute("SELECT COUNT(*) FROM reference_options WHERE company_id = ?", (company_id,)).fetchone()[0]
+    if existing:
+        return
+    defaults = load_reference_options_json(REFERENCE_OPTIONS_FILE)
+    write_reference_options_to_database(connection, defaults, company_id)
+
+
+def create_company(name: str, path: Path = DB_FILE) -> dict[str, str]:
+    normalized = normalize_company_name(name)
+    existing = find_company_by_name(normalized, path)
+    if existing:
+        return existing
+    company = {
+        "id": f"company-{uuid.uuid4().hex[:12]}",
+        "name": normalized,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        connection.execute(
+            "INSERT INTO companies(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (company["id"], company["name"], company["created_at"], company["updated_at"]),
+        )
+        seed_reference_options_for_company(connection, company["id"])
+        connection.commit()
+    return company
+
+
+def delete_company(company_id: str, path: Path = DB_FILE) -> None:
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        connection.execute("DELETE FROM flights WHERE company_id = ?", (company_id,))
+        connection.execute("DELETE FROM reference_options WHERE company_id = ?", (company_id,))
+        connection.execute("DELETE FROM companies WHERE id = ?", (company_id,))
+        settings = {
+            row["key"]: row["value"]
+            for row in connection.execute("SELECT key, value FROM app_settings WHERE key IN ('current_company_id', 'remember_login')")
+        }
+        if settings.get("current_company_id") == company_id:
+            connection.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES('current_company_id', '')")
+            connection.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES('remember_login', '0')")
+        connection.commit()
+
+
+def login_settings(path: Path = DB_FILE) -> dict[str, str]:
+    ensure_database(path)
+    settings = {"remember_login": "0", "current_company_id": ""}
+    with closing(connect_database(path)) as connection:
+        for row in connection.execute("SELECT key, value FROM app_settings WHERE key IN ('remember_login', 'current_company_id')"):
+            settings[row["key"]] = row["value"]
+    return settings
+
+
+def save_login_settings(company_id: str, remember_login: bool, path: Path = DB_FILE) -> None:
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO app_settings(key, value) VALUES('remember_login', ?)",
+            ("1" if remember_login else "0",),
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO app_settings(key, value) VALUES('current_company_id', ?)",
+            (company_id if remember_login else "",),
+        )
+        connection.commit()
+
+
+def clear_login_settings(path: Path = DB_FILE) -> None:
+    save_login_settings("", False, path)
+
+
+def remembered_company(path: Path = DB_FILE) -> dict[str, str] | None:
+    settings = login_settings(path)
+    if settings.get("remember_login") != "1" or not settings.get("current_company_id"):
+        return None
+    return get_company_by_id(settings["current_company_id"], path)
+
+
+def load_reference_options(path: Path = DB_FILE, company_id: str = DEFAULT_COMPANY_ID) -> dict:
     if not is_database_path(path):
         return load_reference_options_json(path)
     ensure_database(path)
     options = {config["category"]: [] for config in OPTION_FIELDS.values()}
     airline_codes: dict[str, str] = {}
     with closing(connect_database(path)) as connection:
-        for row in connection.execute("SELECT category, value, airline_code FROM reference_options ORDER BY display_order, value"):
+        seed_reference_options_for_company(connection, company_id)
+        connection.commit()
+        for row in connection.execute(
+            "SELECT category, value, airline_code FROM reference_options WHERE company_id = ? ORDER BY display_order, value",
+            (company_id,),
+        ):
             category = row["category"]
             value = row["value"]
             if category in options:
@@ -650,7 +948,7 @@ def load_reference_options(path: Path = DB_FILE) -> dict:
     return options
 
 
-def save_reference_options(options: dict, path: Path = DB_FILE) -> None:
+def save_reference_options(options: dict, path: Path = DB_FILE, company_id: str = DEFAULT_COMPANY_ID) -> None:
     if not is_database_path(path):
         save_reference_options_json(options, path)
         return
@@ -661,7 +959,7 @@ def save_reference_options(options: dict, path: Path = DB_FILE) -> None:
     payload["airline_codes"] = normalize_airline_codes(payload["airlines"], options.get("airline_codes", {}))
     ensure_database(path)
     with closing(connect_database(path)) as connection:
-        write_reference_options_to_database(connection, payload)
+        write_reference_options_to_database(connection, payload, company_id)
         connection.commit()
 
 
@@ -812,7 +1110,7 @@ def validate_record(record: dict[str, str]) -> None:
     for field in ("outbound_flight_no", "return_flight_no"):
         flight_no = record.get(field, "").strip().upper()
         if flight_no and not FLIGHT_NO_RE.fullmatch(flight_no):
-            raise ValueError(f"{FIELD_LABELS[field]}应由两位航司代码和 1 至 4 位数字组成，例如 BF1、9C101、G51001。")
+            raise ValueError(f"{FIELD_LABELS[field]}应由两位子公司代码和 1 至 4 位数字组成，例如 BF1、9C101、G51001。")
     airport_code = record.get("airport_code", "").strip().upper()
     if airport_code and not AIRPORT_RE.fullmatch(airport_code):
         raise ValueError("机场代码应为三个英文字母，例如 RUN、JFK。")
@@ -836,7 +1134,7 @@ def apply_airline_code_prefixes(record: dict[str, str], airline_codes: dict[str,
             record[field] = f"{code}{value}"
             continue
         if FLIGHT_NO_RE.fullmatch(value) and not value.startswith(code):
-            raise ValueError(f"{FIELD_LABELS[field]}必须以所选航司的二字代码 {code} 开头，或仅输入 1 至 4 位数字。")
+            raise ValueError(f"{FIELD_LABELS[field]}必须以所选子公司的二字代码 {code} 开头，或仅输入 1 至 4 位数字。")
         record[field] = value
 
 
@@ -1070,7 +1368,7 @@ def find_time_conflicts(records: list[dict[str, str]], candidate: dict[str, str]
     return conflicts
 
 
-def load_data(path: Path = DB_FILE) -> dict:
+def load_data(path: Path = DB_FILE, company_id: str = DEFAULT_COMPANY_ID) -> dict:
     if not is_database_path(path):
         return load_json_data(path)
     ensure_database(path)
@@ -1087,8 +1385,10 @@ def load_data(path: Path = DB_FILE) -> dict:
                        departure_time, arrival_time, aircraft_type, airline,
                        country_or_region, route_pair_id, source, updated_at
                 FROM flights
+                WHERE company_id = ?
                 ORDER BY display_order, id
-                """
+                """,
+                (company_id,),
             )
         ]
     return {
@@ -1099,28 +1399,28 @@ def load_data(path: Path = DB_FILE) -> dict:
     }
 
 
-def save_data(data: dict, path: Path = DB_FILE) -> None:
+def save_data(data: dict, path: Path = DB_FILE, company_id: str = DEFAULT_COMPANY_ID) -> None:
     if not is_database_path(path):
         save_json_data(data, path)
         return
     ensure_database(path)
     with closing(connect_database(path)) as connection:
         create_database_schema(connection)
-        write_records_to_database(connection, data.get("records", []))
+        write_records_to_database(connection, data.get("records", []), company_id)
         for key in ("schema_version", "generated_from", "generated_at"):
             value = str(data.get(key, SCHEMA_VERSION if key == "schema_version" else ""))
             connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", (key, value))
         connection.commit()
 
 
-def import_json_records_to_database(json_path: Path, db_path: Path = DB_FILE) -> int:
+def import_json_records_to_database(json_path: Path, db_path: Path = DB_FILE, company_id: str = DEFAULT_COMPANY_ID) -> int:
     data = load_json_data(json_path)
     records = data.get("records", [])
     if not records:
         raise ValueError("所选 JSON 文件中没有可导入的航班记录。")
     ensure_database(db_path)
     with closing(connect_database(db_path)) as connection:
-        imported = upsert_records_to_database(connection, records, preserve_existing_on_blank=True)
+        imported = upsert_records_to_database(connection, records, preserve_existing_on_blank=True, company_id=company_id)
         connection.commit()
         return imported
 
@@ -1210,6 +1510,31 @@ def write_csv(path: Path, headers: list[str], rows: list[list[str]]) -> None:
         writer.writerows(rows)
 
 
+def typed_delete_confirmation(parent, item_label: str, item_name: str, detail: str) -> bool:
+    if not messagebox.askyesno(
+        f"确认删除{item_label}",
+        f"{detail}\n\n是否继续？",
+        default=messagebox.NO,
+        parent=parent,
+    ):
+        return False
+    typed = simpledialog.askstring(
+        f"二次确认删除{item_label}",
+        f"请输入要删除的{item_label}名称以确认：\n{item_name}",
+        parent=parent,
+    )
+    if typed is None:
+        return False
+    if typed.strip() != item_name:
+        messagebox.showerror("名称不匹配", "输入的名称与待删除项目不一致，删除已取消。", parent=parent)
+        return False
+    return True
+
+
+def warning_confirmation(parent, title: str, message: str) -> bool:
+    return messagebox.askyesno(title, message, default=messagebox.NO, parent=parent)
+
+
 class OptionManagerDialog(Toplevel):
     def __init__(self, app: "FlightManagerApp", field: str, on_change=None):
         super().__init__(app.root)
@@ -1243,7 +1568,7 @@ class OptionManagerDialog(Toplevel):
         self.table.heading("value", text=self.config_info["label"])
         self.table.column("value", anchor="w", width=350 if self.field == "airline" else 460)
         if self.field == "airline":
-            self.table.heading("code", text="二字代码")
+            self.table.heading("code", text="子公司代码")
             self.table.column("code", anchor="center", width=90)
         self.table.pack(fill=BOTH, expand=True, pady=(0, 10))
         self.table.bind("<<TreeviewSelect>>", lambda _event: self.load_selected())
@@ -1263,7 +1588,7 @@ class OptionManagerDialog(Toplevel):
         if self.field == "airline":
             code_form = ttk.Frame(body)
             code_form.pack(fill=X, pady=(8, 0))
-            ttk.Label(code_form, text="二字代码").pack(side=LEFT, padx=(0, 6))
+            ttk.Label(code_form, text="子公司二字代码").pack(side=LEFT, padx=(0, 6))
             code_entry = ttk.Entry(
                 code_form,
                 textvariable=self.code_text,
@@ -1334,17 +1659,17 @@ class OptionManagerDialog(Toplevel):
         if self.field != "airline":
             return ""
         if not self.code_text.get().strip():
-            messagebox.showerror("航司代码为空", "请为该航司填写二字代码。", parent=self)
+            messagebox.showerror("子公司代码为空", "请为该子公司填写二字代码。", parent=self)
             return None
         try:
             return normalize_airline_code(self.code_text.get())
         except ValueError as exc:
-            messagebox.showerror("航司代码有误", str(exc), parent=self)
+            messagebox.showerror("子公司代码有误", str(exc), parent=self)
             return None
 
     def persist(self) -> None:
         self.app.options[self.category] = normalize_options(self.app.options.get(self.category, []), self.config_info["max_length"])
-        save_reference_options(self.app.options)
+        save_reference_options(self.app.options, company_id=self.app.company["id"])
         self.refresh()
         self.app.refresh_search_option_combos()
         if self.on_change:
@@ -1398,7 +1723,12 @@ class OptionManagerDialog(Toplevel):
             messagebox.showinfo("请选择项目", "请先选择要删除的名称。", parent=self)
             return
         value = self.item_values.get(selected[0], "")
-        if not messagebox.askyesno("确认删除", f"确定删除“{value}”吗？已在航班记录中使用的值不会被自动修改。", default=messagebox.NO, parent=self):
+        if not typed_delete_confirmation(
+            self,
+            self.config_info["label"],
+            value,
+            f"删除“{value}”不会自动修改已使用该值的航班记录，但会从当前母公司的下拉列表中移除。",
+        ):
             return
         self.app.options[self.category] = [item for item in self.values() if item != value]
         if self.field == "airline":
@@ -1745,20 +2075,138 @@ class PairDialog(Toplevel):
             self.destroy()
 
 
-class FlightManagerApp:
-    def __init__(self, root: Tk):
+class CompanyLoginView:
+    def __init__(self, root: Tk, on_login):
         self.root = root
+        self.on_login = on_login
         ensure_database()
-        self.root.title(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
+        self.companies = load_companies()
+        self.company_name = StringVar()
+        self.remember_login = tk.BooleanVar(value=False)
+        self.company_by_name: dict[str, dict[str, str]] = {}
+        self.root.title(f"{APP_DISPLAY_NAME} - 选择母公司")
+        self.root.geometry("720x420")
+        if APP_ICON_FILE.exists():
+            try:
+                self.root.iconbitmap(str(APP_ICON_FILE))
+            except Exception:
+                pass
+
+        self.frame = ttk.Frame(self.root, padding=28)
+        self.frame.pack(fill=BOTH, expand=True)
+        ttk.Label(self.frame, text=APP_DISPLAY_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            self.frame,
+            text="请选择本次需要管理的母公司。登录后，数据管理界面中的“子公司”、航班、机型和国家/地区数据仅属于该母公司。",
+            wraplength=640,
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 18))
+
+        form = ttk.Frame(self.frame)
+        form.pack(fill=X, pady=(0, 12))
+        ttk.Label(form, text="母公司名称").pack(anchor="w", pady=(0, 6))
+        self.company_combo = ttk.Combobox(form, textvariable=self.company_name, values=[], width=42)
+        self.company_combo.pack(fill=X)
+        self.company_combo.bind("<KeyRelease>", lambda _event: self.filter_company_combo())
+        self.company_combo.bind("<Button-1>", lambda _event: self.filter_company_combo())
+        self.company_combo.bind("<Return>", lambda _event: self.login_existing())
+
+        ttk.Checkbutton(self.frame, text="保持登录，下次自动进入该母公司", variable=self.remember_login).pack(anchor="w", pady=(4, 14))
+
+        button_bar = ttk.Frame(self.frame)
+        button_bar.pack(fill=X)
+        ttk.Button(button_bar, text="登录", command=self.login_existing).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(button_bar, text="新建并登录", command=self.create_and_login).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(button_bar, text="删除母公司", command=self.delete_selected_company).pack(side=LEFT)
+
+        ttk.Label(
+            self.frame,
+            text="删除母公司会删除该母公司下的全部航班与下拉选项数据。此操作需要手动输入母公司名称确认。",
+            style="Danger.TLabel",
+            wraplength=640,
+        ).pack(anchor="w", pady=(22, 0))
+        self.refresh_companies()
+        if self.companies:
+            self.company_name.set(self.companies[0]["name"])
+        self.company_combo.focus_set()
+
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+    def refresh_companies(self) -> None:
+        self.companies = load_companies()
+        self.company_by_name = {company["name"].casefold(): company for company in self.companies}
+        self.filter_company_combo()
+
+    def filter_company_combo(self) -> None:
+        names = [company["name"] for company in self.companies]
+        self.company_combo.configure(values=filter_options(names, self.company_name.get(), limit=500))
+
+    def selected_company(self) -> dict[str, str] | None:
+        name = self.company_name.get().strip()
+        if not name:
+            messagebox.showerror("母公司名称为空", "请输入或选择母公司名称。", parent=self.root)
+            return None
+        company = self.company_by_name.get(name.casefold())
+        if not company:
+            return None
+        return company
+
+    def login_existing(self) -> None:
+        company = self.selected_company()
+        if not company:
+            messagebox.showerror("母公司不存在", "未找到该母公司。请从下拉列表选择，或点击“新建并登录”。", parent=self.root)
+            return
+        save_login_settings(company["id"], self.remember_login.get())
+        self.destroy()
+        self.on_login(company)
+
+    def create_and_login(self) -> None:
+        try:
+            company = create_company(self.company_name.get())
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            messagebox.showerror("无法新建母公司", str(exc), parent=self.root)
+            return
+        save_login_settings(company["id"], self.remember_login.get())
+        self.destroy()
+        self.on_login(company)
+
+    def delete_selected_company(self) -> None:
+        company = self.selected_company()
+        if not company:
+            messagebox.showerror("母公司不存在", "请先从下拉列表选择要删除的母公司。", parent=self.root)
+            return
+        if not typed_delete_confirmation(
+            self.root,
+            "母公司",
+            company["name"],
+            "删除母公司会删除该母公司下的全部航班记录、子公司、机型、国家/地区等本地数据，且不会影响其他母公司。",
+        ):
+            return
+        delete_company(company["id"])
+        self.company_name.set("")
+        self.refresh_companies()
+        if self.companies:
+            self.company_name.set(self.companies[0]["name"])
+        messagebox.showinfo("母公司已删除", f"已删除母公司：{company['name']}", parent=self.root)
+
+
+class FlightManagerApp:
+    def __init__(self, root: Tk, company: dict[str, str], on_logout=None):
+        self.root = root
+        self.company = company
+        self.on_logout = on_logout
+        ensure_database()
+        self.root.title(f"{APP_DISPLAY_NAME} v{APP_VERSION} - {self.company['name']}")
         self.root.geometry("1280x780")
         if APP_ICON_FILE.exists():
             try:
                 self.root.iconbitmap(str(APP_ICON_FILE))
             except Exception:
                 pass
-        self.data = load_data()
+        self.data = load_data(company_id=self.company["id"])
         self.records: list[dict[str, str]] = self.data["records"]
-        self.options = load_reference_options()
+        self.options = load_reference_options(company_id=self.company["id"])
         self.ui_settings = load_ui_settings()
         self.theme_mode = str(self.ui_settings["theme_mode"])
         self.hidden_columns = list(self.ui_settings["hidden_columns"])
@@ -1793,6 +2241,7 @@ class FlightManagerApp:
         self.content: ttk.PanedWindow | None = None
         self.reminder_frame: ttk.LabelFrame | None = None
         self.reminder_visible = False
+        self.root_frame: ttk.Frame | None = None
         self._build_ui()
         self.apply_theme()
         self.apply_display_columns()
@@ -1801,9 +2250,10 @@ class FlightManagerApp:
 
     def _build_ui(self) -> None:
         root_frame = ttk.Frame(self.root, padding=12)
+        self.root_frame = root_frame
         root_frame.pack(fill=BOTH, expand=True)
 
-        search_frame = ttk.LabelFrame(root_frame, text="精准查询", padding=10)
+        search_frame = ttk.LabelFrame(root_frame, text=f"精准查询（当前母公司：{self.company['name']}）", padding=10)
         search_frame.pack(fill=X)
 
         search_inputs = ttk.Frame(search_frame)
@@ -1827,7 +2277,7 @@ class FlightManagerApp:
             entry.pack(side=LEFT, padx=(0, 14))
             entry.bind("<Return>", lambda _event: self.apply_search())
 
-        self.add_search_option_combo(search_options, "航空公司", "airline", 20)
+        self.add_search_option_combo(search_options, "子公司", "airline", 20)
         self.add_search_option_combo(search_options, "机型", "aircraft_type", 18)
         self.add_search_option_combo(search_options, "国家/地区", "country_or_region", 20)
 
@@ -1858,6 +2308,7 @@ class FlightManagerApp:
             ("恢复备份", self.restore_database_backup),
             ("导出 Excel/CSV", self.export_visible_data),
             ("从 JSON 导入旧数据", self.import_legacy_json),
+            ("退出当前登录", self.logout),
             ("关于", self.show_about),
         ):
             ttk.Button(utility_buttons, text=text, command=command).pack(side=LEFT, padx=(0, 6))
@@ -2171,9 +2622,9 @@ class FlightManagerApp:
                 raise ValueError(f"{FIELD_LABELS[field]}必须从下拉列表中选择。若需要新增，请点击旁边的“管理”按钮。")
 
     def reload_from_database(self, select_id: str | None = None) -> None:
-        self.data = load_data()
+        self.data = load_data(company_id=self.company["id"])
         self.records = self.data["records"]
-        self.options = load_reference_options()
+        self.options = load_reference_options(company_id=self.company["id"])
         self.refresh_search_option_combos()
         self.refresh(select_id=select_id)
 
@@ -2283,12 +2734,26 @@ class FlightManagerApp:
         ):
             return
         try:
-            imported = import_json_records_to_database(Path(source))
+            imported = import_json_records_to_database(Path(source), company_id=self.company["id"])
             self.reload_from_database()
         except (OSError, ValueError, json.JSONDecodeError, DatabaseStartupError) as exc:
             messagebox.showerror("导入失败", f"无法导入所选 JSON 文件：\n{exc}", parent=self.root)
             return
         messagebox.showinfo("导入完成", f"已导入或更新 {imported} 条航班记录。", parent=self.root)
+
+    def logout(self) -> None:
+        if not warning_confirmation(
+            self.root,
+            "退出当前登录",
+            "退出后将返回母公司登录界面，并取消保持登录设置。\n\n是否继续？",
+        ):
+            return
+        clear_login_settings()
+        if self.root_frame is not None:
+            self.root_frame.destroy()
+            self.root_frame = None
+        if self.on_logout:
+            self.on_logout()
 
     def show_about(self) -> None:
         about = Toplevel(self.root)
@@ -2307,6 +2772,7 @@ class FlightManagerApp:
         ttk.Label(body, text=APP_DISPLAY_NAME, font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 8))
         ttk.Label(body, text=f"版本：{APP_VERSION}").pack(anchor="w", pady=2)
         ttk.Label(body, text=f"作者：{APP_AUTHOR}").pack(anchor="w", pady=2)
+        ttk.Label(body, text=f"当前母公司：{self.company['name']}").pack(anchor="w", pady=2)
         ttk.Label(body, text=f"数据库：{DB_FILE}").pack(anchor="w", pady=2)
         ttk.Label(body, text="GitHub：").pack(anchor="w", pady=(10, 2))
         link = ttk.Label(body, text=GITHUB_URL, style="Link.TLabel", cursor="hand2")
@@ -2378,7 +2844,7 @@ class FlightManagerApp:
 
     def persist_and_refresh(self, select_id: str | None = None) -> None:
         self.data["records"] = self.records
-        save_data(self.data)
+        save_data(self.data, company_id=self.company["id"])
         self.refresh(select_id=select_id)
 
     def selected_record(self) -> dict[str, str] | None:
@@ -2542,12 +3008,20 @@ class FlightManagerApp:
             )
             return
         lines = "\n".join(f"- {record_summary(item)}" for item in group)
-        if not messagebox.askyesno(
-            "确认删除往返航班",
+        group_name = " / ".join(
+            part
+            for part in (
+                group_display_value(group, "outbound_flight_no"),
+                group_display_value(group, "return_flight_no"),
+            )
+            if part
+        ) or group_display_value(group, "route_pair_id") or record_summary(group[0])
+        if not typed_delete_confirmation(
+            self.root,
+            "往返航班",
+            group_name,
             "删除操作将一并删除该关联组内的去程/返程航班，不允许仅删除其中任一单个航班。\n\n"
-            f"将删除 {len(group)} 条记录：\n{lines}\n\n是否一键删除整组？",
-            default=messagebox.NO,
-            parent=self.root,
+            f"将删除 {len(group)} 条记录：\n{lines}",
         ):
             return
         delete_ids = {item["id"] for item in group}
@@ -2569,9 +3043,33 @@ class FlightManagerApp:
 
 def main() -> None:
     root = Tk()
-    ttk.Style().theme_use("clam")
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure("Muted.TLabel", foreground="#64748B")
+    style.configure("Danger.TLabel", foreground="#B91C1C")
+    style.configure("Warning.TLabel", foreground="#C2410C")
+    style.configure("Link.TLabel", foreground="#2563EB")
+
+    def show_login() -> None:
+        for child in root.winfo_children():
+            child.destroy()
+        CompanyLoginView(root, open_company)
+
+    def open_company(company: dict[str, str]) -> None:
+        for child in root.winfo_children():
+            child.destroy()
+        try:
+            FlightManagerApp(root, company, on_logout=show_login)
+        except DatabaseStartupError as exc:
+            messagebox.showerror("数据库无法打开", str(exc), parent=root)
+            root.destroy()
+
     try:
-        FlightManagerApp(root)
+        company = remembered_company()
+        if company:
+            open_company(company)
+        else:
+            show_login()
     except DatabaseStartupError as exc:
         messagebox.showerror("数据库无法打开", str(exc), parent=root)
         root.destroy()

@@ -1,6 +1,6 @@
-# Frenchbee Flight Schedule Manager
+# 航班航线管理程序
 
-A local Python desktop tool for managing airport flight route schedule data.
+A local Python desktop tool for managing parent-company-isolated airport flight route schedule data.
 
 ## Files
 
@@ -10,8 +10,8 @@ A local Python desktop tool for managing airport flight route schedule data.
 - `reference_options.json`: legacy dropdown dictionaries migrated into SQLite on first database creation.
 - `flight_manager.py`: Tkinter GUI for adding, searching, editing, deleting, and supplementing route records.
 - `test_flight_manager.py`: unit tests for import integrity, search, conflict detection, and JSON round-trip behavior.
-- `FrenchbeeFlightManager.spec`: PyInstaller build configuration for the Windows executable.
-- `frenchbee_flight_manager.ico`: desktop icon used by the app and executable.
+- `FlightRouteManager.spec`: PyInstaller build configuration for the Windows executable.
+- `flight_route_manager.ico`: desktop icon used by the app and executable.
 
 ## Run
 
@@ -27,14 +27,18 @@ When migrating from an older JSON-based version, place the old `flight_schedule.
 Install PyInstaller in the Python environment you want to build with, then run:
 
 ```powershell
-python -m PyInstaller FrenchbeeFlightManager.spec
+python -m PyInstaller FlightRouteManager.spec
 ```
 
-The executable is created at `dist/FrenchbeeFlightManager.exe`. Keep `flight_schedule.db` next to the executable after first run; it is the user's editable local database.
+The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedule.db` next to the executable after first run; it is the user's editable local database.
 
 ## Main features
 
 - Add, edit, delete, and precisely search route records.
+- Startup parent-company login lets the user choose which parent company dataset to manage; no username or password is required.
+- Optional keep-login behavior reopens the last selected parent company until the user logs out from the main window.
+- Parent companies isolate flight records and local dropdown options from one another.
+- The main management UI uses “subsidiary” for the company operating the route; subsidiaries are managed in the local dropdown manager and can have a two-character code.
 - SQLite database storage with startup integrity checks and friendly database error messages.
 - Backup and restore the SQLite database from the main window.
 - Export the currently displayed routes to Excel `.xlsx` or CSV.
@@ -47,14 +51,15 @@ The executable is created at `dist/FrenchbeeFlightManager.exe`. Keep `flight_sch
 - Main table rows use soft alternating colors while retaining status colors for missing or unpaired routes.
 - Main table zoom controls adjust table font, row height, and column width from 80% to 140%.
 - New records must include every required field before they can be saved.
-- Flight numbers must be unique and use a two-character airline code plus 1-4 digits.
-- Airline options include a required two-character code, which is automatically prefixed to outbound and return flight numbers.
+- Flight numbers must be unique and use a two-character subsidiary code plus 1-4 digits.
+- Subsidiary options include a required two-character code, which is automatically prefixed to outbound and return flight numbers.
 - Airport codes must use three letters.
 - Outbound departure and return arrival times are selected with separate hour and five-minute interval dropdowns.
-- Search supports airline, aircraft type, country/region filtering plus exact-time and time-range filters for outbound departure and return arrival.
+- Search supports subsidiary, aircraft type, country/region filtering plus exact-time and time-range filters for outbound departure and return arrival.
 - The main table collapses associated outbound/return records into one displayed route and supports three-state header sorting: ascending, descending, and default order.
-- Aircraft type, airline, and country/region fields are searchable dropdowns; typed text only filters choices and must match an existing option to save.
-- Aircraft type and airline options are managed in local popups and are limited to 25 characters; countries/regions are limited to 50 characters and can also be renamed.
+- Aircraft type, subsidiary, and country/region fields are searchable dropdowns; typed text only filters choices and must match an existing option to save.
+- Aircraft type and subsidiary options are managed in local popups and are limited to 25 characters; countries/regions are limited to 50 characters and can also be renamed.
+- Deleting a parent company, subsidiary, aircraft type, country/region, or paired route group requires an extra typed confirmation.
 - Warn when outbound departure or return arrival times are already occupied.
 - Mark records with missing required fields for later completion.
 - Manually associate outbound and return flight records after legacy records are completed, using same-airport existing records as candidates.
@@ -73,6 +78,6 @@ python -m unittest -v
 
 ## Notes
 
-The source workbook does not include flight numbers, aircraft type, airline, or country/region data. Imported records keep those fields blank as placeholders, and the GUI marks incomplete records for later completion.
+The source workbook does not include flight numbers, aircraft type, subsidiary, or country/region data. Imported records keep those fields blank as placeholders, and the GUI marks incomplete records for later completion.
 
 The source workbook also does not provide a reliable outbound/return pairing. Existing imported records remain unpaired until the user manually associates them in the GUI.

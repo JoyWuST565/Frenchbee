@@ -13,6 +13,9 @@ from flight_manager import (
     apply_airline_code_prefixes,
     blank_record,
     clamp_table_zoom,
+    clear_login_settings,
+    create_company,
+    delete_company,
     filter_records,
     filter_options,
     find_duplicate_flight_numbers,
@@ -21,6 +24,7 @@ from flight_manager import (
     grouped_display_records,
     load_ui_settings,
     import_json_records_to_database,
+    load_companies,
     load_data,
     load_reference_options,
     missing_fields,
@@ -29,8 +33,11 @@ from flight_manager import (
     normalize_airline_code,
     normalize_time,
     paired_group,
+    remembered_company,
     route_info_complete,
     save_data,
+    save_login_settings,
+    save_reference_options,
     save_ui_settings,
     sort_display_groups,
     strong_pair_candidates,
@@ -221,6 +228,36 @@ class FlightScheduleDataTests(unittest.TestCase):
         self.assertEqual(clamp_table_zoom(20), 80)
         self.assertEqual(clamp_table_zoom(170), 140)
         self.assertEqual(clamp_table_zoom("bad"), 100)
+
+    def test_parent_company_data_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "flight_schedule.db"
+            alpha = create_company("Alpha Holdings", db_path)
+            beta = create_company("Beta Group", db_path)
+            alpha_record = {**blank_record(), "id": "shared-route", "airport_code": "JFK", "airline": "Alpha Air"}
+            beta_record = {**blank_record(), "id": "shared-route", "airport_code": "LAX", "airline": "Beta Air"}
+
+            save_data({"schema_version": 1, "records": [alpha_record]}, db_path, company_id=alpha["id"])
+            save_data({"schema_version": 1, "records": [beta_record]}, db_path, company_id=beta["id"])
+            save_reference_options({"airlines": ["Alpha Air"], "airline_codes": {"Alpha Air": "AA"}}, db_path, company_id=alpha["id"])
+            save_reference_options({"airlines": ["Beta Air"], "airline_codes": {"Beta Air": "BB"}}, db_path, company_id=beta["id"])
+
+            self.assertEqual(load_data(db_path, company_id=alpha["id"])["records"][0]["airport_code"], "JFK")
+            self.assertEqual(load_data(db_path, company_id=beta["id"])["records"][0]["airport_code"], "LAX")
+            self.assertEqual(load_reference_options(db_path, company_id=alpha["id"])["airlines"], ["Alpha Air"])
+            self.assertEqual(load_reference_options(db_path, company_id=beta["id"])["airlines"], ["Beta Air"])
+
+    def test_company_login_settings_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "flight_schedule.db"
+            company = create_company("Gamma Parent", db_path)
+            save_login_settings(company["id"], True, db_path)
+            self.assertTrue(any(item["id"] == company["id"] for item in load_companies(db_path)))
+            self.assertEqual(remembered_company(db_path)["id"], company["id"])
+            delete_company(company["id"], db_path)
+            self.assertIsNone(remembered_company(db_path))
+            self.assertFalse(any(item["id"] == company["id"] for item in load_companies(db_path)))
+            clear_login_settings(db_path)
 
     def test_complete_unpaired_record_requires_manual_pairing(self) -> None:
         record = {
