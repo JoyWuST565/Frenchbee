@@ -10,6 +10,7 @@ from flight_manager import (
     MINUTE_OPTIONS,
     TIME_OPTIONS,
     DISPLAY_COLUMNS,
+    OPTION_FIELDS,
     apply_airline_code_prefixes,
     blank_record,
     clamp_table_zoom,
@@ -34,6 +35,7 @@ from flight_manager import (
     normalize_time,
     paired_group,
     remembered_company,
+    rename_company,
     route_info_complete,
     save_data,
     save_login_settings,
@@ -254,10 +256,19 @@ class FlightScheduleDataTests(unittest.TestCase):
             save_login_settings(company["id"], True, db_path)
             self.assertTrue(any(item["id"] == company["id"] for item in load_companies(db_path)))
             self.assertEqual(remembered_company(db_path)["id"], company["id"])
+            renamed = rename_company(company["id"], "Gamma Holdings", db_path)
+            self.assertEqual(renamed["id"], company["id"])
+            self.assertEqual(renamed["name"], "Gamma Holdings")
+            self.assertEqual(remembered_company(db_path)["id"], company["id"])
             delete_company(company["id"], db_path)
             self.assertIsNone(remembered_company(db_path))
             self.assertFalse(any(item["id"] == company["id"] for item in load_companies(db_path)))
             clear_login_settings(db_path)
+
+    def test_reference_option_management_allows_expected_renames(self) -> None:
+        self.assertTrue(OPTION_FIELDS["aircraft_type"]["allow_rename"])
+        self.assertTrue(OPTION_FIELDS["airline"]["allow_rename"])
+        self.assertTrue(OPTION_FIELDS["country_or_region"]["allow_rename"])
 
     def test_complete_unpaired_record_requires_manual_pairing(self) -> None:
         record = {

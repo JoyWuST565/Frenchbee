@@ -36,6 +36,7 @@ The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedul
 
 - Add, edit, delete, and precisely search route records.
 - Startup parent-company login lets the user choose which parent company dataset to manage; no username or password is required.
+- Parent-company add, rename, and delete actions live in the **管理母公司** dialog on the login screen.
 - Optional keep-login behavior reopens the last selected parent company until the user logs out from the main window.
 - Parent companies isolate flight records and local dropdown options from one another.
 - The main management UI uses “subsidiary” for the company operating the route; subsidiaries are managed in the local dropdown manager and can have a two-character code.
@@ -44,7 +45,7 @@ The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedul
 - Export the currently displayed routes to Excel `.xlsx` or CSV.
 - Import legacy `flight_schedule.json` records from the main window.
 - About window with software name, version, author, and GitHub link.
-- Light and dark UI modes with comfortable non-pure-white/non-pure-black colors.
+- Light and dark UI modes with comfortable non-pure-white/non-pure-black colors; the login screen follows the last saved mode.
 - Main table UI preferences are stored locally in SQLite, including theme, hidden columns, and table zoom.
 - The pending-completion reminder panel automatically hides when there is nothing to fix and reappears when missing or unpaired records exist.
 - Right-click the main data table to hide or restore display columns without changing the underlying data.
@@ -58,7 +59,7 @@ The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedul
 - Search supports subsidiary, aircraft type, country/region filtering plus exact-time and time-range filters for outbound departure and return arrival.
 - The main table collapses associated outbound/return records into one displayed route and supports three-state header sorting: ascending, descending, and default order.
 - Aircraft type, subsidiary, and country/region fields are searchable dropdowns; typed text only filters choices and must match an existing option to save.
-- Aircraft type and subsidiary options are managed in local popups and are limited to 25 characters; countries/regions are limited to 50 characters and can also be renamed.
+- Aircraft type and subsidiary options are managed in local popups and are limited to 25 characters; aircraft types, subsidiaries, and countries/regions can be renamed.
 - Deleting a parent company, subsidiary, aircraft type, country/region, or paired route group requires an extra typed confirmation.
 - Warn when outbound departure or return arrival times are already occupied.
 - Mark records with missing required fields for later completion.

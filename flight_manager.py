@@ -223,7 +223,7 @@ OPTION_FIELDS = {
         "category": "aircraft_types",
         "label": "机型",
         "max_length": 25,
-        "allow_rename": False,
+        "allow_rename": True,
     },
     "airline": {
         "category": "airlines",
@@ -871,6 +871,36 @@ def create_company(name: str, path: Path = DB_FILE) -> dict[str, str]:
     return company
 
 
+def rename_company(company_id: str, new_name: str, path: Path = DB_FILE) -> dict[str, str]:
+    normalized = normalize_company_name(new_name)
+    ensure_database(path)
+    with closing(connect_database(path)) as connection:
+        current = connection.execute(
+            "SELECT id, name, created_at, updated_at FROM companies WHERE id = ?",
+            (company_id,),
+        ).fetchone()
+        if not current:
+            raise ValueError("未找到需要重命名的母公司。")
+        duplicate = connection.execute(
+            "SELECT id FROM companies WHERE lower(name) = lower(?) AND id <> ?",
+            (normalized, company_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("该母公司名称已存在。")
+        timestamp = now_iso()
+        connection.execute(
+            "UPDATE companies SET name = ?, updated_at = ? WHERE id = ?",
+            (normalized, timestamp, company_id),
+        )
+        connection.commit()
+    return get_company_by_id(company_id, path) or {
+        "id": company_id,
+        "name": normalized,
+        "created_at": current["created_at"],
+        "updated_at": timestamp,
+    }
+
+
 def delete_company(company_id: str, path: Path = DB_FILE) -> None:
     ensure_database(path)
     with closing(connect_database(path)) as connection:
@@ -1041,6 +1071,33 @@ def save_ui_settings(settings: dict[str, object], path: Path = DB_FILE) -> None:
         for key, value in payload.items():
             connection.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES(?, ?)", (key, value))
         connection.commit()
+
+
+def apply_theme_styles(root: Tk, style: ttk.Style, theme_mode: str) -> dict[str, str]:
+    mode = normalize_theme_mode(theme_mode)
+    palette = THEME_PALETTES[mode]
+    root.configure(background=palette["window"])
+    style.configure(".", background=palette["window"], foreground=palette["text"], font=("Segoe UI", 9))
+    style.configure("TFrame", background=palette["window"])
+    style.configure("TLabelframe", background=palette["window"], bordercolor=palette["heading"])
+    style.configure("TLabelframe.Label", background=palette["window"], foreground=palette["text"], font=("Segoe UI", 9, "bold"))
+    style.configure("TLabel", background=palette["window"], foreground=palette["text"])
+    style.configure("Status.TLabel", background=palette["window"], foreground=palette["text"])
+    style.configure("Muted.TLabel", background=palette["window"], foreground=palette["muted"])
+    style.configure("Danger.TLabel", background=palette["window"], foreground=palette["missing"])
+    style.configure("Warning.TLabel", background=palette["window"], foreground=palette["pairing"])
+    style.configure("Link.TLabel", background=palette["window"], foreground=palette["link"])
+    style.configure("TButton", background=palette["button"], foreground=palette["text"], padding=(8, 4))
+    style.map("TButton", background=[("active", palette["button_hover"])])
+    style.configure("TCheckbutton", background=palette["window"], foreground=palette["text"])
+    style.map("TCheckbutton", background=[("active", palette["window"])], foreground=[("active", palette["text"])])
+    style.configure("TEntry", fieldbackground=palette["field"], foreground=palette["text"], insertcolor=palette["text"])
+    style.configure("TCombobox", fieldbackground=palette["field"], foreground=palette["text"], arrowcolor=palette["text"])
+    style.configure("Treeview", background=palette["field"], fieldbackground=palette["field"], foreground=palette["text"])
+    style.configure("Treeview.Heading", background=palette["heading"], foreground=palette["text"], font=("Segoe UI", 9, "bold"))
+    style.map("Treeview", background=[("selected", palette["selected"])], foreground=[("selected", palette["selected_text"])])
+    style.map("Main.Treeview", background=[("selected", palette["selected"])], foreground=[("selected", palette["selected_text"])])
+    return palette
 
 
 def normalize_time(value: str) -> str:
@@ -2075,6 +2132,140 @@ class PairDialog(Toplevel):
             self.destroy()
 
 
+class CompanyManagerDialog(Toplevel):
+    def __init__(self, root: Tk, on_change=None):
+        super().__init__(root)
+        self.on_change = on_change
+        self.company_name = StringVar()
+        self.companies: list[dict[str, str]] = []
+        self.item_companies: dict[str, dict[str, str]] = {}
+        self.title("管理母公司")
+        self.geometry("560x460")
+        self.transient(root)
+        self.grab_set()
+        if APP_ICON_FILE.exists():
+            try:
+                self.iconbitmap(str(APP_ICON_FILE))
+            except Exception:
+                pass
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill=BOTH, expand=True)
+        ttk.Label(
+            body,
+            text="母公司用于隔离不同公司集团的数据。重命名不会影响该母公司下已有航班与子公司数据。",
+            style="Muted.TLabel",
+            wraplength=500,
+        ).pack(anchor="w", pady=(0, 10))
+
+        self.table = ttk.Treeview(body, columns=("name",), show="headings", selectmode="browse", height=11)
+        self.table.heading("name", text="现有母公司")
+        self.table.column("name", anchor="w", width=500)
+        self.table.pack(fill=BOTH, expand=True, pady=(0, 10))
+        self.table.bind("<<TreeviewSelect>>", lambda _event: self.load_selected())
+
+        form = ttk.Frame(body)
+        form.pack(fill=X, pady=(0, 10))
+        ttk.Label(form, text=f"母公司名称（≤{COMPANY_NAME_MAX_LENGTH}字符）").pack(side=LEFT, padx=(0, 8))
+        self.name_entry = ttk.Entry(
+            form,
+            textvariable=self.company_name,
+            validate="key",
+            validatecommand=(self.register(lambda value: len(value) <= COMPANY_NAME_MAX_LENGTH), "%P"),
+        )
+        self.name_entry.pack(side=LEFT, fill=X, expand=True)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=X)
+        ttk.Button(buttons, text="新增", command=self.add_company).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="重命名选中", command=self.rename_selected).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="删除选中", command=self.delete_selected).pack(side=LEFT)
+        ttk.Button(buttons, text="关闭", command=self.destroy).pack(side=RIGHT)
+
+        self.refresh()
+        self.name_entry.focus_set()
+
+    def refresh(self, select_id: str | None = None) -> None:
+        self.companies = load_companies()
+        self.item_companies = {}
+        self.table.delete(*self.table.get_children())
+        for company in self.companies:
+            item_id = company["id"]
+            self.item_companies[item_id] = company
+            self.table.insert("", END, iid=item_id, values=(company["name"],))
+        if select_id and self.table.exists(select_id):
+            self.table.selection_set(select_id)
+            self.table.focus(select_id)
+            self.table.see(select_id)
+        if self.on_change:
+            self.on_change()
+
+    def load_selected(self) -> None:
+        selected = self.table.selection()
+        if selected:
+            company = self.item_companies.get(selected[0])
+            if company:
+                self.company_name.set(company["name"])
+
+    def selected_company(self) -> dict[str, str] | None:
+        selected = self.table.selection()
+        if not selected:
+            messagebox.showinfo("请选择母公司", "请先选择要操作的母公司。", parent=self)
+            return None
+        return self.item_companies.get(selected[0])
+
+    def validate_company_name(self, allow_current_id: str = "") -> str | None:
+        try:
+            name = normalize_company_name(self.company_name.get())
+        except ValueError as exc:
+            messagebox.showerror("母公司名称有误", str(exc), parent=self)
+            return None
+        existing = find_company_by_name(name)
+        if existing and existing["id"] != allow_current_id:
+            messagebox.showerror("母公司名称重复", "该母公司名称已存在。", parent=self)
+            return None
+        return name
+
+    def add_company(self) -> None:
+        name = self.validate_company_name()
+        if not name:
+            return
+        company = create_company(name)
+        self.refresh(select_id=company["id"])
+        self.company_name.set(company["name"])
+
+    def rename_selected(self) -> None:
+        company = self.selected_company()
+        if not company:
+            return
+        name = self.validate_company_name(allow_current_id=company["id"])
+        if not name:
+            return
+        try:
+            renamed = rename_company(company["id"], name)
+        except ValueError as exc:
+            messagebox.showerror("无法重命名母公司", str(exc), parent=self)
+            return
+        self.refresh(select_id=renamed["id"])
+        self.company_name.set(renamed["name"])
+
+    def delete_selected(self) -> None:
+        company = self.selected_company()
+        if not company:
+            return
+        if not typed_delete_confirmation(
+            self,
+            "母公司",
+            company["name"],
+            "删除母公司会删除该母公司下的全部航班记录、子公司、机型、国家/地区等本地数据，且不会影响其他母公司。",
+        ):
+            return
+        delete_company(company["id"])
+        self.company_name.set("")
+        self.refresh()
+        messagebox.showinfo("母公司已删除", f"已删除母公司：{company['name']}", parent=self)
+
+
 class CompanyLoginView:
     def __init__(self, root: Tk, on_login):
         self.root = root
@@ -2097,7 +2288,7 @@ class CompanyLoginView:
         ttk.Label(self.frame, text=APP_DISPLAY_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 8))
         ttk.Label(
             self.frame,
-            text="请选择本次需要管理的母公司。登录后，数据管理界面中的“子公司”、航班、机型和国家/地区数据仅属于该母公司。",
+            text="请选择本次需要管理的母公司。登录后，数据管理界面中的“子公司”、航班、机型和国家/地区数据仅属于该母公司。新增、删除或重命名母公司请进入“管理母公司”。",
             wraplength=640,
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(0, 18))
@@ -2116,13 +2307,12 @@ class CompanyLoginView:
         button_bar = ttk.Frame(self.frame)
         button_bar.pack(fill=X)
         ttk.Button(button_bar, text="登录", command=self.login_existing).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(button_bar, text="新建并登录", command=self.create_and_login).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(button_bar, text="删除母公司", command=self.delete_selected_company).pack(side=LEFT)
+        ttk.Button(button_bar, text="管理母公司", command=self.open_company_manager).pack(side=LEFT)
 
         ttk.Label(
             self.frame,
-            text="删除母公司会删除该母公司下的全部航班与下拉选项数据。此操作需要手动输入母公司名称确认。",
-            style="Danger.TLabel",
+            text="提示：删除母公司会删除该母公司下的全部航班与下拉选项数据，并要求手动输入母公司名称确认。",
+            style="Warning.TLabel",
             wraplength=640,
         ).pack(anchor="w", pady=(22, 0))
         self.refresh_companies()
@@ -2134,8 +2324,11 @@ class CompanyLoginView:
         self.frame.destroy()
 
     def refresh_companies(self) -> None:
+        current_name = self.company_name.get().strip()
         self.companies = load_companies()
         self.company_by_name = {company["name"].casefold(): company for company in self.companies}
+        if current_name and current_name.casefold() not in self.company_by_name and self.companies:
+            self.company_name.set(self.companies[0]["name"])
         self.filter_company_combo()
 
     def filter_company_combo(self) -> None:
@@ -2155,40 +2348,14 @@ class CompanyLoginView:
     def login_existing(self) -> None:
         company = self.selected_company()
         if not company:
-            messagebox.showerror("母公司不存在", "未找到该母公司。请从下拉列表选择，或点击“新建并登录”。", parent=self.root)
+            messagebox.showerror("母公司不存在", "未找到该母公司。请从下拉列表选择，或点击“管理母公司”新增。", parent=self.root)
             return
         save_login_settings(company["id"], self.remember_login.get())
         self.destroy()
         self.on_login(company)
 
-    def create_and_login(self) -> None:
-        try:
-            company = create_company(self.company_name.get())
-        except (ValueError, sqlite3.DatabaseError) as exc:
-            messagebox.showerror("无法新建母公司", str(exc), parent=self.root)
-            return
-        save_login_settings(company["id"], self.remember_login.get())
-        self.destroy()
-        self.on_login(company)
-
-    def delete_selected_company(self) -> None:
-        company = self.selected_company()
-        if not company:
-            messagebox.showerror("母公司不存在", "请先从下拉列表选择要删除的母公司。", parent=self.root)
-            return
-        if not typed_delete_confirmation(
-            self.root,
-            "母公司",
-            company["name"],
-            "删除母公司会删除该母公司下的全部航班记录、子公司、机型、国家/地区等本地数据，且不会影响其他母公司。",
-        ):
-            return
-        delete_company(company["id"])
-        self.company_name.set("")
-        self.refresh_companies()
-        if self.companies:
-            self.company_name.set(self.companies[0]["name"])
-        messagebox.showinfo("母公司已删除", f"已删除母公司：{company['name']}", parent=self.root)
+    def open_company_manager(self) -> None:
+        CompanyManagerDialog(self.root, on_change=self.refresh_companies)
 
 
 class FlightManagerApp:
@@ -2400,26 +2567,7 @@ class FlightManagerApp:
         )
 
     def apply_theme(self) -> None:
-        palette = self.palette()
-        self.root.configure(background=palette["window"])
-        self.style.configure(".", background=palette["window"], foreground=palette["text"], font=("Segoe UI", 9))
-        self.style.configure("TFrame", background=palette["window"])
-        self.style.configure("TLabelframe", background=palette["window"], bordercolor=palette["heading"])
-        self.style.configure("TLabelframe.Label", background=palette["window"], foreground=palette["text"], font=("Segoe UI", 9, "bold"))
-        self.style.configure("TLabel", background=palette["window"], foreground=palette["text"])
-        self.style.configure("Status.TLabel", background=palette["window"], foreground=palette["text"])
-        self.style.configure("Muted.TLabel", background=palette["window"], foreground=palette["muted"])
-        self.style.configure("Danger.TLabel", background=palette["window"], foreground=palette["missing"])
-        self.style.configure("Warning.TLabel", background=palette["window"], foreground=palette["pairing"])
-        self.style.configure("Link.TLabel", background=palette["window"], foreground=palette["link"])
-        self.style.configure("TButton", background=palette["button"], foreground=palette["text"], padding=(8, 4))
-        self.style.map("TButton", background=[("active", palette["button_hover"])])
-        self.style.configure("TEntry", fieldbackground=palette["field"], foreground=palette["text"], insertcolor=palette["text"])
-        self.style.configure("TCombobox", fieldbackground=palette["field"], foreground=palette["text"], arrowcolor=palette["text"])
-        self.style.configure("Treeview", background=palette["field"], fieldbackground=palette["field"], foreground=palette["text"])
-        self.style.configure("Treeview.Heading", background=palette["heading"], foreground=palette["text"], font=("Segoe UI", 9, "bold"))
-        self.style.map("Treeview", background=[("selected", palette["selected"])], foreground=[("selected", palette["selected_text"])])
-        self.style.map("Main.Treeview", background=[("selected", palette["selected"])], foreground=[("selected", palette["selected_text"])])
+        palette = apply_theme_styles(self.root, self.style, self.theme_mode)
         self.apply_table_zoom()
         self.configure_table_tags()
         self.update_theme_button()
@@ -3045,14 +3193,11 @@ def main() -> None:
     root = Tk()
     style = ttk.Style(root)
     style.theme_use("clam")
-    style.configure("Muted.TLabel", foreground="#64748B")
-    style.configure("Danger.TLabel", foreground="#B91C1C")
-    style.configure("Warning.TLabel", foreground="#C2410C")
-    style.configure("Link.TLabel", foreground="#2563EB")
 
     def show_login() -> None:
         for child in root.winfo_children():
             child.destroy()
+        apply_theme_styles(root, style, str(load_ui_settings()["theme_mode"]))
         CompanyLoginView(root, open_company)
 
     def open_company(company: dict[str, str]) -> None:
