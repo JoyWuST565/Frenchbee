@@ -9,28 +9,34 @@ from flight_manager import (
     HOUR_OPTIONS,
     MINUTE_OPTIONS,
     TIME_OPTIONS,
+    DISPLAY_COLUMNS,
     apply_airline_code_prefixes,
     blank_record,
+    clamp_table_zoom,
     filter_records,
     filter_options,
     find_duplicate_flight_numbers,
     find_time_conflicts,
     group_display_value,
     grouped_display_records,
+    load_ui_settings,
     import_json_records_to_database,
     load_data,
     load_reference_options,
     missing_fields,
+    normalize_hidden_columns,
     needs_pairing,
     normalize_airline_code,
     normalize_time,
     paired_group,
     route_info_complete,
     save_data,
+    save_ui_settings,
     sort_display_groups,
     strong_pair_candidates,
     sync_blank_pair_fields,
     validate_record,
+    visible_display_columns,
     write_csv,
     write_xlsx,
 )
@@ -186,6 +192,35 @@ class FlightScheduleDataTests(unittest.TestCase):
         descending = sort_display_groups(groups, "airport_code", "desc")
         self.assertEqual([group_display_value(group, "airport_code") for group in descending], ["LAX", "JFK"])
         self.assertIs(sort_display_groups(groups, "airport_code", None), groups)
+
+    def test_ui_settings_round_trip_in_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "flight_schedule.db"
+            defaults = load_ui_settings(db_path)
+            self.assertEqual(defaults["theme_mode"], "light")
+            self.assertEqual(defaults["hidden_columns"], [])
+            self.assertEqual(defaults["table_zoom"], 100)
+
+            save_ui_settings(
+                {
+                    "theme_mode": "dark",
+                    "hidden_columns": ["airline", "route_pair_id"],
+                    "table_zoom": 130,
+                },
+                db_path,
+            )
+            loaded = load_ui_settings(db_path)
+            self.assertEqual(loaded["theme_mode"], "dark")
+            self.assertEqual(loaded["hidden_columns"], ["airline", "route_pair_id"])
+            self.assertEqual(loaded["table_zoom"], 130)
+
+    def test_hidden_columns_and_zoom_normalization(self) -> None:
+        hidden = normalize_hidden_columns(list(DISPLAY_COLUMNS))
+        self.assertEqual(len(hidden), len(DISPLAY_COLUMNS) - 1)
+        self.assertEqual(len(visible_display_columns(hidden)), 1)
+        self.assertEqual(clamp_table_zoom(20), 80)
+        self.assertEqual(clamp_table_zoom(170), 140)
+        self.assertEqual(clamp_table_zoom("bad"), 100)
 
     def test_complete_unpaired_record_requires_manual_pairing(self) -> None:
         record = {

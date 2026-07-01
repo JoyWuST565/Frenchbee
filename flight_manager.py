@@ -78,6 +78,15 @@ REFERENCE_OPTIONS_FILE = RUNTIME_REFERENCE_OPTIONS_FILE if RUNTIME_REFERENCE_OPT
 APP_ICON_FILE = RESOURCE_DIR / "frenchbee_flight_manager.ico"
 SCHEMA_VERSION = 1
 DATABASE_SCHEMA_VERSION = 1
+THEME_MODES = ("light", "dark")
+TABLE_ZOOM_MIN = 80
+TABLE_ZOOM_MAX = 140
+TABLE_ZOOM_STEP = 10
+DEFAULT_UI_SETTINGS = {
+    "theme_mode": "light",
+    "hidden_columns": "[]",
+    "table_zoom": "100",
+}
 SUPPLEMENTARY_FIELDS = (
     "outbound_flight_no",
     "return_flight_no",
@@ -145,6 +154,56 @@ DISPLAY_HEADINGS = {
     "airline": "航空公司",
     "country_or_region": "国家/地区",
     "route_pair_id": "关联ID",
+}
+DEFAULT_COLUMN_WIDTHS = {
+    "status": 95,
+    "outbound_flight_no": 100,
+    "return_flight_no": 100,
+    "airport_code": 70,
+    "departure_time": 70,
+    "arrival_time": 70,
+    "aircraft_type": 90,
+    "airline": 120,
+    "country_or_region": 120,
+    "route_pair_id": 95,
+}
+THEME_PALETTES = {
+    "light": {
+        "window": "#F4F1EA",
+        "panel": "#ECEFF3",
+        "field": "#FBFAF7",
+        "text": "#1F2937",
+        "muted": "#64748B",
+        "heading": "#E3E8EF",
+        "button": "#E6EBF1",
+        "button_hover": "#D6DEE8",
+        "row_even": "#FAFAF6",
+        "row_odd": "#EEF4F8",
+        "selected": "#C7D2FE",
+        "selected_text": "#111827",
+        "missing": "#B91C1C",
+        "pairing": "#C2410C",
+        "complete": "#047857",
+        "link": "#2563EB",
+    },
+    "dark": {
+        "window": "#1F2933",
+        "panel": "#273442",
+        "field": "#243140",
+        "text": "#E5E7EB",
+        "muted": "#B6C2CF",
+        "heading": "#334155",
+        "button": "#344256",
+        "button_hover": "#41516A",
+        "row_even": "#243140",
+        "row_odd": "#2B3A4A",
+        "selected": "#475569",
+        "selected_text": "#F8FAFC",
+        "missing": "#FCA5A5",
+        "pairing": "#FDBA74",
+        "complete": "#86EFAC",
+        "link": "#93C5FD",
+    },
 }
 
 TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -322,12 +381,21 @@ def create_database_schema(connection: sqlite3.Connection) -> None:
             display_order INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (category, value)
         );
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
     )
     connection.execute(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
         ("database_schema_version", str(DATABASE_SCHEMA_VERSION)),
     )
+    for key, value in DEFAULT_UI_SETTINGS.items():
+        connection.execute(
+            "INSERT OR IGNORE INTO app_settings(key, value) VALUES(?, ?)",
+            (key, value),
+        )
 
 
 def check_database_integrity(path: Path = DB_FILE) -> None:
@@ -537,6 +605,9 @@ def maybe_import_runtime_legacy_json(path: Path = DB_FILE) -> int:
 def ensure_database(path: Path = DB_FILE) -> None:
     if path.exists():
         check_database_integrity(path)
+        with closing(connect_database(path)) as connection:
+            create_database_schema(connection)
+            connection.commit()
         maybe_import_runtime_legacy_json(path)
         return
     is_primary_database = path.resolve() == DB_FILE.resolve()
@@ -602,6 +673,76 @@ def filter_options(values: list[str], term: str, limit: int | None = 80) -> list
     contains = [value for value in values if term in value.casefold() and value not in starts]
     results = starts + contains
     return results if limit is None else results[:limit]
+
+
+def normalize_theme_mode(value: str) -> str:
+    value = str(value or "").strip().lower()
+    return value if value in THEME_MODES else DEFAULT_UI_SETTINGS["theme_mode"]
+
+
+def clamp_table_zoom(value: str | int) -> int:
+    try:
+        zoom = int(value)
+    except (TypeError, ValueError):
+        zoom = int(DEFAULT_UI_SETTINGS["table_zoom"])
+    zoom = max(TABLE_ZOOM_MIN, min(TABLE_ZOOM_MAX, zoom))
+    return int(round(zoom / TABLE_ZOOM_STEP) * TABLE_ZOOM_STEP)
+
+
+def normalize_hidden_columns(value: str | list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    if isinstance(value, str):
+        try:
+            raw = json.loads(value)
+        except json.JSONDecodeError:
+            raw = []
+    else:
+        raw = list(value)
+    hidden: list[str] = []
+    for column in raw:
+        if column in DISPLAY_COLUMNS and column not in hidden:
+            hidden.append(column)
+    if len(hidden) >= len(DISPLAY_COLUMNS):
+        hidden = hidden[:-1]
+    return hidden
+
+
+def visible_display_columns(hidden_columns: list[str] | tuple[str, ...] | set[str]) -> tuple[str, ...]:
+    hidden = set(normalize_hidden_columns(list(hidden_columns)))
+    visible = tuple(column for column in DISPLAY_COLUMNS if column not in hidden)
+    return visible or (DISPLAY_COLUMNS[0],)
+
+
+def load_ui_settings(path: Path = DB_FILE) -> dict[str, object]:
+    ensure_database(path)
+    values = dict(DEFAULT_UI_SETTINGS)
+    with closing(connect_database(path)) as connection:
+        create_database_schema(connection)
+        for row in connection.execute("SELECT key, value FROM app_settings"):
+            if row["key"] in values:
+                values[row["key"]] = row["value"]
+        connection.commit()
+    return {
+        "theme_mode": normalize_theme_mode(values.get("theme_mode", "")),
+        "hidden_columns": normalize_hidden_columns(values.get("hidden_columns", "[]")),
+        "table_zoom": clamp_table_zoom(values.get("table_zoom", "100")),
+    }
+
+
+def save_ui_settings(settings: dict[str, object], path: Path = DB_FILE) -> None:
+    ensure_database(path)
+    payload = {
+        "theme_mode": normalize_theme_mode(str(settings.get("theme_mode", DEFAULT_UI_SETTINGS["theme_mode"]))),
+        "hidden_columns": json.dumps(
+            normalize_hidden_columns(settings.get("hidden_columns", [])),
+            ensure_ascii=False,
+        ),
+        "table_zoom": str(clamp_table_zoom(settings.get("table_zoom", DEFAULT_UI_SETTINGS["table_zoom"]))),
+    }
+    with closing(connect_database(path)) as connection:
+        create_database_schema(connection)
+        for key, value in payload.items():
+            connection.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES(?, ?)", (key, value))
+        connection.commit()
 
 
 def normalize_time(value: str) -> str:
@@ -1131,7 +1272,7 @@ class OptionManagerDialog(Toplevel):
                 validatecommand=(self.register(self.limit_airline_code), "%P"),
             )
             code_entry.pack(side=LEFT)
-            ttk.Label(code_form, text="仅限两位大写字母或数字，如 BF、9C、G5、23", foreground="#6B7280").pack(side=LEFT, padx=(8, 0))
+            ttk.Label(code_form, text="仅限两位大写字母或数字，如 BF、9C、G5、23", style="Muted.TLabel").pack(side=LEFT, padx=(8, 0))
 
         buttons = ttk.Frame(body)
         buttons.pack(fill=X, pady=(10, 0))
@@ -1289,12 +1430,12 @@ class FlightEditor(Toplevel):
         body = ttk.Frame(self, padding=16)
         body.pack(fill=BOTH, expand=True)
 
-        ttk.Label(body, text="带红点的字段需要补录", foreground="#B91C1C").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(body, text="带红点的字段需要补录", style="Danger.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
         if self.original_id and self.app.get_counterparts(self.record):
             ttk.Label(
                 body,
                 text="该航线已有关联航班。修改后请同步检查对应的去程或返程航班。",
-                foreground="#C2410C",
+                style="Warning.TLabel",
             ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
             row_offset = 1
         else:
@@ -1304,7 +1445,7 @@ class FlightEditor(Toplevel):
             label_text = FIELD_LABELS[field]
             if field in missing_fields(self.record):
                 label_text = f"● {label_text}"
-            label = ttk.Label(body, text=label_text, foreground="#B91C1C" if field in missing_fields(self.record) else "#111827")
+            label = ttk.Label(body, text=label_text, style="Danger.TLabel" if field in missing_fields(self.record) else "TLabel")
             label.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=5)
             if self.supplement_mode and self.record.get(field, ""):
                 self.readonly_fields.add(field)
@@ -1360,7 +1501,7 @@ class FlightEditor(Toplevel):
         minute_combo.bind("<KeyRelease>", lambda _event, combo=minute_combo: self.filter_static_combo(combo, MINUTE_OPTIONS))
         self.time_widgets[field] = (hour_combo, minute_combo)
         self.field_widgets[field] = hour_combo
-        ttk.Label(parent, text="每 5 分钟", foreground="#6B7280").grid(row=row, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(parent, text="每 5 分钟", style="Muted.TLabel").grid(row=row, column=2, sticky="w", padx=(8, 0))
 
     def create_option_selector(self, parent: ttk.Frame, row: int, field: str) -> None:
         config = OPTION_FIELDS[field]
@@ -1537,9 +1678,9 @@ class PairDialog(Toplevel):
         body.pack(fill=BOTH, expand=True)
 
         ttk.Label(body, text="当前航线").pack(anchor="w")
-        ttk.Label(body, text=record_summary(source), foreground="#111827").pack(anchor="w", pady=(0, 10))
+        ttk.Label(body, text=record_summary(source)).pack(anchor="w", pady=(0, 10))
         if notice:
-            ttk.Label(body, text=notice, foreground="#C2410C", wraplength=780).pack(anchor="w", pady=(0, 10))
+            ttk.Label(body, text=notice, style="Warning.TLabel", wraplength=780).pack(anchor="w", pady=(0, 10))
 
         search_bar = ttk.Frame(body)
         search_bar.pack(fill=X, pady=(0, 8))
@@ -1618,6 +1759,10 @@ class FlightManagerApp:
         self.data = load_data()
         self.records: list[dict[str, str]] = self.data["records"]
         self.options = load_reference_options()
+        self.ui_settings = load_ui_settings()
+        self.theme_mode = str(self.ui_settings["theme_mode"])
+        self.hidden_columns = list(self.ui_settings["hidden_columns"])
+        self.table_zoom = int(self.ui_settings["table_zoom"])
         self.current_results: list[dict[str, str]] = []
         self.current_display_groups: list[list[dict[str, str]]] = []
         self.search_vars = {
@@ -1641,7 +1786,17 @@ class FlightManagerApp:
         self.sort_direction: str | None = None
         self.table_headings: dict[str, str] = {}
         self.status_var = StringVar()
+        self.zoom_text = StringVar(value=f"{self.table_zoom}%")
+        self.style = ttk.Style(self.root)
+        self.style.theme_use("clam")
+        self.theme_button: ttk.Button | None = None
+        self.content: ttk.PanedWindow | None = None
+        self.reminder_frame: ttk.LabelFrame | None = None
+        self.reminder_visible = False
         self._build_ui()
+        self.apply_theme()
+        self.apply_display_columns()
+        self.apply_table_zoom()
         self.refresh()
 
     def _build_ui(self) -> None:
@@ -1706,63 +1861,57 @@ class FlightManagerApp:
             ("关于", self.show_about),
         ):
             ttk.Button(utility_buttons, text=text, command=command).pack(side=LEFT, padx=(0, 6))
+        ttk.Separator(utility_buttons, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=(4, 10))
+        self.theme_button = ttk.Button(utility_buttons, text="", command=self.toggle_theme)
+        self.theme_button.pack(side=LEFT, padx=(0, 6))
+        ttk.Label(utility_buttons, text="表格缩放").pack(side=LEFT, padx=(4, 6))
+        ttk.Button(utility_buttons, text="−", width=3, command=self.zoom_out).pack(side=LEFT, padx=(0, 2))
+        ttk.Label(utility_buttons, textvariable=self.zoom_text, width=5, anchor="center").pack(side=LEFT, padx=(2, 2))
+        ttk.Button(utility_buttons, text="+", width=3, command=self.zoom_in).pack(side=LEFT, padx=(2, 2))
+        ttk.Button(utility_buttons, text="重置", command=self.reset_zoom).pack(side=LEFT, padx=(4, 0))
 
-        content = ttk.PanedWindow(root_frame, orient="horizontal")
-        content.pack(fill=BOTH, expand=True, pady=(12, 8))
+        self.content = ttk.PanedWindow(root_frame, orient="horizontal")
+        self.content.pack(fill=BOTH, expand=True, pady=(12, 8))
 
-        table_frame = ttk.Frame(content)
-        reminder_frame = ttk.LabelFrame(content, text="待补录提醒", padding=10)
-        content.add(table_frame, weight=4)
-        content.add(reminder_frame, weight=2)
+        table_frame = ttk.Frame(self.content)
+        self.reminder_frame = ttk.LabelFrame(self.content, text="待补录提醒", padding=10)
+        self.content.add(table_frame, weight=4)
+        self.content.add(self.reminder_frame, weight=2)
+        self.reminder_visible = True
 
         columns = DISPLAY_COLUMNS
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse", style="Main.Treeview")
         self.table_headings = dict(DISPLAY_HEADINGS)
-        widths = {
-            "status": 95,
-            "outbound_flight_no": 100,
-            "return_flight_no": 100,
-            "airport_code": 70,
-            "departure_time": 70,
-            "arrival_time": 70,
-            "aircraft_type": 90,
-            "airline": 120,
-            "country_or_region": 120,
-            "route_pair_id": 95,
-        }
         for column in columns:
             self.table.heading(column, text=self.sort_heading_text(column), command=lambda item=column: self.toggle_sort(item))
-            self.table.column(column, width=widths[column], anchor="center", stretch=column in {"airline", "country_or_region"})
+            self.table.column(column, width=DEFAULT_COLUMN_WIDTHS[column], anchor="center", stretch=column in {"airline", "country_or_region"})
 
         yscroll = ttk.Scrollbar(table_frame, orient=VERTICAL, command=self.table.yview)
         self.table.configure(yscrollcommand=yscroll.set)
         self.table.pack(side=LEFT, fill=BOTH, expand=True)
         yscroll.pack(side=RIGHT, fill=Y)
-        self.table.tag_configure("missing", foreground="#B91C1C")
-        self.table.tag_configure("pairing", foreground="#C2410C")
-        self.table.tag_configure("complete", foreground="#065F46")
         self.table.bind("<Double-1>", lambda _event: self.edit_selected())
+        self.table.bind("<Button-3>", self.show_column_menu)
+        self.table.bind("<Control-Button-1>", self.show_column_menu)
 
-        self.reminder_note = ttk.Label(reminder_frame, text="单击待补录项打开编辑；单击待关联项打开关联窗口。", foreground="#B91C1C", wraplength=320)
+        self.reminder_note = ttk.Label(self.reminder_frame, text="单击待补录项打开编辑；单击待关联项打开关联窗口。", style="Danger.TLabel", wraplength=320)
         self.reminder_note.pack(anchor="w", pady=(0, 8))
         reminder_columns = ("summary", "missing")
-        self.reminders = ttk.Treeview(reminder_frame, columns=reminder_columns, show="headings", selectmode="browse", height=18)
+        self.reminders = ttk.Treeview(self.reminder_frame, columns=reminder_columns, show="headings", selectmode="browse", height=18)
         self.reminders.heading("summary", text="航线")
         self.reminders.heading("missing", text="提醒事项")
         self.reminders.column("summary", width=210, anchor="w")
         self.reminders.column("missing", width=210, anchor="w")
-        reminder_scroll = ttk.Scrollbar(reminder_frame, orient=VERTICAL, command=self.reminders.yview)
+        reminder_scroll = ttk.Scrollbar(self.reminder_frame, orient=VERTICAL, command=self.reminders.yview)
         self.reminders.configure(yscrollcommand=reminder_scroll.set)
         self.reminders.pack(side=LEFT, fill=BOTH, expand=True)
         reminder_scroll.pack(side=RIGHT, fill=Y)
-        self.reminders.tag_configure("missing", foreground="#B91C1C")
-        self.reminders.tag_configure("pairing", foreground="#C2410C")
         self.reminders.bind("<ButtonRelease-1>", self.open_reminder_from_click)
 
         status_bar = ttk.Frame(root_frame)
         status_bar.pack(fill=X)
-        ttk.Label(status_bar, textvariable=self.status_var, foreground="#374151").pack(side=LEFT)
-        ttk.Label(status_bar, text=f"数据库：{DB_FILE.name}", foreground="#6B7280").pack(side=RIGHT)
+        ttk.Label(status_bar, textvariable=self.status_var, style="Status.TLabel").pack(side=LEFT)
+        ttk.Label(status_bar, text=f"数据库：{DB_FILE.name}", style="Muted.TLabel").pack(side=RIGHT)
 
     def sort_heading_text(self, column: str) -> str:
         label = self.table_headings.get(column, column)
@@ -1786,6 +1935,158 @@ class FlightManagerApp:
             self.sort_direction = None
         self.update_sort_headings()
         self.refresh()
+
+    def palette(self) -> dict[str, str]:
+        return THEME_PALETTES[self.theme_mode if self.theme_mode in THEME_PALETTES else "light"]
+
+    def persist_ui_settings(self) -> None:
+        save_ui_settings(
+            {
+                "theme_mode": self.theme_mode,
+                "hidden_columns": self.hidden_columns,
+                "table_zoom": self.table_zoom,
+            }
+        )
+
+    def apply_theme(self) -> None:
+        palette = self.palette()
+        self.root.configure(background=palette["window"])
+        self.style.configure(".", background=palette["window"], foreground=palette["text"], font=("Segoe UI", 9))
+        self.style.configure("TFrame", background=palette["window"])
+        self.style.configure("TLabelframe", background=palette["window"], bordercolor=palette["heading"])
+        self.style.configure("TLabelframe.Label", background=palette["window"], foreground=palette["text"], font=("Segoe UI", 9, "bold"))
+        self.style.configure("TLabel", background=palette["window"], foreground=palette["text"])
+        self.style.configure("Status.TLabel", background=palette["window"], foreground=palette["text"])
+        self.style.configure("Muted.TLabel", background=palette["window"], foreground=palette["muted"])
+        self.style.configure("Danger.TLabel", background=palette["window"], foreground=palette["missing"])
+        self.style.configure("Warning.TLabel", background=palette["window"], foreground=palette["pairing"])
+        self.style.configure("Link.TLabel", background=palette["window"], foreground=palette["link"])
+        self.style.configure("TButton", background=palette["button"], foreground=palette["text"], padding=(8, 4))
+        self.style.map("TButton", background=[("active", palette["button_hover"])])
+        self.style.configure("TEntry", fieldbackground=palette["field"], foreground=palette["text"], insertcolor=palette["text"])
+        self.style.configure("TCombobox", fieldbackground=palette["field"], foreground=palette["text"], arrowcolor=palette["text"])
+        self.style.configure("Treeview", background=palette["field"], fieldbackground=palette["field"], foreground=palette["text"])
+        self.style.configure("Treeview.Heading", background=palette["heading"], foreground=palette["text"], font=("Segoe UI", 9, "bold"))
+        self.style.map("Treeview", background=[("selected", palette["selected"])], foreground=[("selected", palette["selected_text"])])
+        self.style.map("Main.Treeview", background=[("selected", palette["selected"])], foreground=[("selected", palette["selected_text"])])
+        self.apply_table_zoom()
+        self.configure_table_tags()
+        self.update_theme_button()
+
+    def configure_table_tags(self) -> None:
+        if not hasattr(self, "table"):
+            return
+        palette = self.palette()
+        for state, foreground in (
+            ("missing", palette["missing"]),
+            ("pairing", palette["pairing"]),
+            ("complete", palette["complete"]),
+        ):
+            for parity, background in (("even", palette["row_even"]), ("odd", palette["row_odd"])):
+                self.table.tag_configure(f"{state}_{parity}", foreground=foreground, background=background)
+        if hasattr(self, "reminders"):
+            self.reminders.tag_configure("missing", foreground=palette["missing"], background=palette["row_even"])
+            self.reminders.tag_configure("pairing", foreground=palette["pairing"], background=palette["row_odd"])
+
+    def update_theme_button(self) -> None:
+        if self.theme_button is None:
+            return
+        self.theme_button.configure(text="浅色模式" if self.theme_mode == "dark" else "深色模式")
+
+    def toggle_theme(self) -> None:
+        self.theme_mode = "light" if self.theme_mode == "dark" else "dark"
+        self.apply_theme()
+        self.persist_ui_settings()
+        self.refresh()
+
+    def apply_table_zoom(self) -> None:
+        if not hasattr(self, "table"):
+            return
+        self.table_zoom = clamp_table_zoom(self.table_zoom)
+        scale = self.table_zoom / 100
+        body_size = max(8, int(round(9 * scale)))
+        heading_size = max(8, int(round(9 * scale)))
+        row_height = max(22, int(round(26 * scale)))
+        self.style.configure("Main.Treeview", font=("Segoe UI", body_size), rowheight=row_height)
+        self.style.configure("Main.Treeview.Heading", font=("Segoe UI", heading_size, "bold"))
+        for column, width in DEFAULT_COLUMN_WIDTHS.items():
+            self.table.column(
+                column,
+                width=max(48, int(round(width * scale))),
+                anchor="center",
+                stretch=column in {"airline", "country_or_region"},
+            )
+        self.zoom_text.set(f"{self.table_zoom}%")
+
+    def set_table_zoom(self, value: int) -> None:
+        self.table_zoom = clamp_table_zoom(value)
+        self.apply_table_zoom()
+        self.persist_ui_settings()
+
+    def zoom_in(self) -> None:
+        self.set_table_zoom(self.table_zoom + TABLE_ZOOM_STEP)
+
+    def zoom_out(self) -> None:
+        self.set_table_zoom(self.table_zoom - TABLE_ZOOM_STEP)
+
+    def reset_zoom(self) -> None:
+        self.set_table_zoom(int(DEFAULT_UI_SETTINGS["table_zoom"]))
+
+    def apply_display_columns(self) -> None:
+        if not hasattr(self, "table"):
+            return
+        self.hidden_columns = normalize_hidden_columns(self.hidden_columns)
+        self.table.configure(displaycolumns=visible_display_columns(self.hidden_columns))
+
+    def show_column_menu(self, event) -> None:
+        menu = tk.Menu(self.root, tearoff=False)
+        hidden = set(self.hidden_columns)
+        for column in DISPLAY_COLUMNS:
+            visible_var = tk.BooleanVar(value=column not in hidden)
+            menu.add_checkbutton(
+                label=DISPLAY_HEADINGS[column],
+                variable=visible_var,
+                command=lambda item=column, var=visible_var: self.set_column_visibility(item, var.get()),
+            )
+        menu.add_separator()
+        menu.add_command(label="显示全部列", command=self.show_all_columns)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def set_column_visibility(self, column: str, visible: bool) -> None:
+        hidden = set(normalize_hidden_columns(self.hidden_columns))
+        current_visible = [item for item in DISPLAY_COLUMNS if item not in hidden]
+        if not visible:
+            if column not in hidden and len(current_visible) <= 1:
+                messagebox.showwarning("至少保留一列", "数据表至少需要保留一列可见。", parent=self.root)
+                return
+            hidden.add(column)
+        else:
+            hidden.discard(column)
+        self.hidden_columns = normalize_hidden_columns([column for column in DISPLAY_COLUMNS if column in hidden])
+        if self.sort_column in hidden:
+            self.sort_column = None
+            self.sort_direction = None
+            self.update_sort_headings()
+        self.apply_display_columns()
+        self.persist_ui_settings()
+
+    def show_all_columns(self) -> None:
+        self.hidden_columns = []
+        self.apply_display_columns()
+        self.persist_ui_settings()
+
+    def update_reminder_visibility(self, has_items: bool) -> None:
+        if self.content is None or self.reminder_frame is None:
+            return
+        if has_items and not self.reminder_visible:
+            self.content.add(self.reminder_frame, weight=2)
+            self.reminder_visible = True
+        elif not has_items and self.reminder_visible:
+            self.content.forget(self.reminder_frame)
+            self.reminder_visible = False
 
     def add_search_option_combo(self, parent: ttk.Frame, label_text: str, field: str, width: int) -> None:
         ttk.Label(parent, text=label_text).pack(side=LEFT, padx=(0, 6))
@@ -2008,7 +2309,7 @@ class FlightManagerApp:
         ttk.Label(body, text=f"作者：{APP_AUTHOR}").pack(anchor="w", pady=2)
         ttk.Label(body, text=f"数据库：{DB_FILE}").pack(anchor="w", pady=2)
         ttk.Label(body, text="GitHub：").pack(anchor="w", pady=(10, 2))
-        link = ttk.Label(body, text=GITHUB_URL, foreground="#2563EB", cursor="hand2")
+        link = ttk.Label(body, text=GITHUB_URL, style="Link.TLabel", cursor="hand2")
         link.pack(anchor="w")
         link.bind("<Button-1>", lambda _event: webbrowser.open(GITHUB_URL))
         ttk.Button(body, text="关闭", command=about.destroy).pack(anchor="e", pady=(14, 0))
@@ -2024,7 +2325,7 @@ class FlightManagerApp:
         self.table_row_records = {}
         self.record_to_row_id = {}
         self.table.delete(*self.table.get_children())
-        for group in self.current_display_groups:
+        for index, group in enumerate(self.current_display_groups):
             row_id = group_row_id(group)
             self.table_row_records[row_id] = group
             for record in group:
@@ -2043,7 +2344,9 @@ class FlightManagerApp:
                 group_display_value(group, "country_or_region"),
                 group_display_value(group, "route_pair_id"),
             )
-            tag = "missing" if missing else "pairing" if pairing else "complete"
+            state = "missing" if missing else "pairing" if pairing else "complete"
+            parity = "even" if index % 2 == 0 else "odd"
+            tag = f"{state}_{parity}"
             self.table.insert("", END, iid=row_id, values=values, tags=(tag,))
         self.refresh_reminders()
         if select_id:
@@ -2061,13 +2364,17 @@ class FlightManagerApp:
 
     def refresh_reminders(self) -> None:
         self.reminders.delete(*self.reminders.get_children())
+        reminder_count = 0
         for record in self.records:
             missing = missing_fields(record)
             if missing:
                 labels = "缺失：" + "、".join(FIELD_LABELS[field] for field in missing)
                 self.reminders.insert("", END, iid=record["id"], values=(record_summary(record), labels), tags=("missing",))
+                reminder_count += 1
             elif needs_pairing(record):
                 self.reminders.insert("", END, iid=record["id"], values=(record_summary(record), "需关联去程/返程航班"), tags=("pairing",))
+                reminder_count += 1
+        self.update_reminder_visibility(reminder_count > 0)
 
     def persist_and_refresh(self, select_id: str | None = None) -> None:
         self.data["records"] = self.records
@@ -2159,7 +2466,7 @@ class FlightManagerApp:
 
         body = ttk.Frame(prompt, padding=16)
         body.pack(fill=BOTH, expand=True)
-        ttk.Label(body, text="该航线已保存。请同步检查并修改其对应的去程或返程航班。", foreground="#C2410C", wraplength=360).pack(anchor="w", pady=(0, 10))
+        ttk.Label(body, text="该航线已保存。请同步检查并修改其对应的去程或返程航班。", style="Warning.TLabel", wraplength=360).pack(anchor="w", pady=(0, 10))
         ttk.Label(body, text=record_summary(record), wraplength=360).pack(anchor="w", pady=(0, 12))
         button_bar = ttk.Frame(body)
         button_bar.pack(fill=X)

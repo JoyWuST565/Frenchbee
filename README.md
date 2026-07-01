@@ -40,6 +40,12 @@ The executable is created at `dist/FrenchbeeFlightManager.exe`. Keep `flight_sch
 - Export the currently displayed routes to Excel `.xlsx` or CSV.
 - Import legacy `flight_schedule.json` records from the main window.
 - About window with software name, version, author, and GitHub link.
+- Light and dark UI modes with comfortable non-pure-white/non-pure-black colors.
+- Main table UI preferences are stored locally in SQLite, including theme, hidden columns, and table zoom.
+- The pending-completion reminder panel automatically hides when there is nothing to fix and reappears when missing or unpaired records exist.
+- Right-click the main data table to hide or restore display columns without changing the underlying data.
+- Main table rows use soft alternating colors while retaining status colors for missing or unpaired routes.
+- Main table zoom controls adjust table font, row height, and column width from 80% to 140%.
 - New records must include every required field before they can be saved.
 - Flight numbers must be unique and use a two-character airline code plus 1-4 digits.
 - Airline options include a required two-character code, which is automatically prefixed to outbound and return flight numbers.
