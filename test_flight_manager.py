@@ -33,6 +33,7 @@ from flight_manager import (
     needs_pairing,
     normalize_airline_code,
     normalize_time,
+    option_linked_delete_ids,
     paired_group,
     remembered_company,
     rename_company,
@@ -295,6 +296,17 @@ class FlightScheduleDataTests(unittest.TestCase):
         ]
         self.assertEqual([record["id"] for record in paired_group(paired, paired[0])], ["a", "b"])
         self.assertEqual(paired_group(paired, paired[2]), [])
+
+    def test_option_linked_delete_ids_include_paired_routes(self) -> None:
+        records = [
+            {**blank_record(), "id": "outbound", "route_pair_id": "pair-1", "airline": "French bee", "aircraft_type": "A350"},
+            {**blank_record(), "id": "return", "route_pair_id": "pair-1", "airline": "French bee", "aircraft_type": "A350"},
+            {**blank_record(), "id": "other-type", "route_pair_id": "", "airline": "Air France", "aircraft_type": "A330"},
+            {**blank_record(), "id": "other-country", "route_pair_id": "", "country_or_region": "France"},
+        ]
+        self.assertEqual(option_linked_delete_ids(records, "airline", "French bee"), {"outbound", "return"})
+        self.assertEqual(option_linked_delete_ids(records, "aircraft_type", "A330"), {"other-type"})
+        self.assertEqual(option_linked_delete_ids(records, "country_or_region", "France"), set())
 
     def test_time_normalization(self) -> None:
         self.assertEqual(normalize_time("0815"), "08:15")

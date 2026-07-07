@@ -239,6 +239,7 @@ OPTION_FIELDS = {
     },
 }
 OPTION_CATEGORIES = {config["category"]: field for field, config in OPTION_FIELDS.items()}
+CASCADE_DELETE_OPTION_FIELDS = {"aircraft_type", "airline"}
 HOUR_OPTIONS = [f"{hour:02d}" for hour in range(24)]
 MINUTE_OPTIONS = [f"{minute:02d}" for minute in range(0, 60, 5)]
 TIME_OPTIONS = [f"{hour}:{minute}" for hour in HOUR_OPTIONS for minute in MINUTE_OPTIONS]
@@ -1375,6 +1376,25 @@ def paired_group(records: list[dict[str, str]], record: dict[str, str]) -> list[
     return [item for item in records if item.get("route_pair_id") == pair_id]
 
 
+def option_linked_delete_ids(records: list[dict[str, str]], field: str, value: str) -> set[str]:
+    if field not in CASCADE_DELETE_OPTION_FIELDS:
+        return set()
+    target = value.strip()
+    if not target:
+        return set()
+    direct_records = [record for record in records if record.get(field, "").strip() == target]
+    direct_ids = {record.get("id", "") for record in direct_records if record.get("id", "")}
+    pair_ids = {record.get("route_pair_id", "") for record in direct_records if record.get("route_pair_id", "").strip()}
+    linked_ids = set(direct_ids)
+    if pair_ids:
+        linked_ids.update(
+            record.get("id", "")
+            for record in records
+            if record.get("route_pair_id", "") in pair_ids and record.get("id", "")
+        )
+    return linked_ids
+
+
 def same_airport_candidates(records: list[dict[str, str]], source: dict[str, str]) -> list[dict[str, str]]:
     airport_code = source.get("airport_code", "")
     if not airport_code:
@@ -1780,11 +1800,23 @@ class OptionManagerDialog(Toplevel):
             messagebox.showinfo("请选择项目", "请先选择要删除的名称。", parent=self)
             return
         value = self.item_values.get(selected[0], "")
+        linked_delete_ids = option_linked_delete_ids(self.app.records, self.field, value)
+        linked_records = [record for record in self.app.records if record.get("id") in linked_delete_ids]
+        if linked_records:
+            linked_group_count = len(grouped_display_records(linked_records))
+            detail = (
+                f"删除“{value}”会从当前母公司的下拉列表中移除该{self.config_info['label']}，"
+                f"并同时删除与其相关联的 {len(linked_records)} 条航班记录"
+                f"（主列表约 {linked_group_count} 条航线显示项）。\n\n"
+                "该操作会直接写入数据库。"
+            )
+        else:
+            detail = f"删除“{value}”会从当前母公司的下拉列表中移除。"
         if not typed_delete_confirmation(
             self,
             self.config_info["label"],
             value,
-            f"删除“{value}”不会自动修改已使用该值的航班记录，但会从当前母公司的下拉列表中移除。",
+            detail,
         ):
             return
         self.app.options[self.category] = [item for item in self.values() if item != value]
@@ -1792,6 +1824,9 @@ class OptionManagerDialog(Toplevel):
             self.app.options.setdefault("airline_codes", {}).pop(value, None)
             self.code_text.set("")
         self.persist()
+        if linked_delete_ids:
+            self.app.records = [record for record in self.app.records if record.get("id") not in linked_delete_ids]
+            self.app.persist_and_refresh()
         self.value_text.set("")
 
 
@@ -2475,6 +2510,8 @@ class FlightManagerApp:
             ("恢复备份", self.restore_database_backup),
             ("导出 Excel/CSV", self.export_visible_data),
             ("从 JSON 导入旧数据", self.import_legacy_json),
+            ("管理子公司", lambda: self.open_option_manager("airline")),
+            ("管理机型", lambda: self.open_option_manager("aircraft_type")),
             ("退出当前登录", self.logout),
             ("关于", self.show_about),
         ):
@@ -2747,6 +2784,9 @@ class FlightManagerApp:
 
     def get_criteria(self) -> dict[str, str]:
         return {key: variable.get() for key, variable in self.search_vars.items()}
+
+    def open_option_manager(self, field: str) -> None:
+        OptionManagerDialog(self, field, on_change=self.refresh_search_option_combos)
 
     def option_values_for_field(self, field: str) -> list[str]:
         config = OPTION_FIELDS[field]

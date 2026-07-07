@@ -44,6 +44,7 @@ The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedul
 - Backup and restore the SQLite database from the main window.
 - Export the currently displayed routes to Excel `.xlsx` or CSV.
 - Import legacy `flight_schedule.json` records from the main window.
+- Manage subsidiaries and aircraft types directly from the main window toolbar.
 - About window with software name, version, author, and GitHub link.
 - Light and dark UI modes with comfortable non-pure-white/non-pure-black colors; the login screen follows the last saved mode.
 - Main table UI preferences are stored locally in SQLite, including theme, hidden columns, and table zoom.
@@ -60,6 +61,7 @@ The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedul
 - The main table collapses associated outbound/return records into one displayed route and supports three-state header sorting: ascending, descending, and default order.
 - Aircraft type, subsidiary, and country/region fields are searchable dropdowns; typed text only filters choices and must match an existing option to save.
 - Aircraft type and subsidiary options are managed in local popups and are limited to 25 characters; aircraft types, subsidiaries, and countries/regions can be renamed.
+- Deleting a subsidiary or aircraft type also deletes all route records linked to it, including the associated outbound/return counterpart when a route is paired.
 - Deleting a parent company, subsidiary, aircraft type, country/region, or paired route group requires an extra typed confirmation.
 - Warn when outbound departure or return arrival times are already occupied.
 - Mark records with missing required fields for later completion.
