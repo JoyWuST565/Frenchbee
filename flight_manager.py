@@ -842,6 +842,21 @@ def find_company_by_name(name: str, path: Path = DB_FILE) -> dict[str, str] | No
     return dict(row) if row else None
 
 
+def choose_login_company_name(
+    companies: list[dict[str, str]],
+    current_name: str = "",
+    preferred_name: str | None = None,
+) -> str:
+    names_by_key = {company["name"].casefold(): company["name"] for company in companies}
+    preferred = (preferred_name or "").strip()
+    if preferred and preferred.casefold() in names_by_key:
+        return names_by_key[preferred.casefold()]
+    current = current_name.strip()
+    if current and current.casefold() in names_by_key:
+        return names_by_key[current.casefold()]
+    return companies[0]["name"] if companies else ""
+
+
 def seed_reference_options_for_company(connection: sqlite3.Connection, company_id: str) -> None:
     existing = connection.execute("SELECT COUNT(*) FROM reference_options WHERE company_id = ?", (company_id,)).fetchone()[0]
     if existing:
@@ -2232,8 +2247,10 @@ class CompanyManagerDialog(Toplevel):
             self.table.selection_set(select_id)
             self.table.focus(select_id)
             self.table.see(select_id)
+
+    def notify_change(self, preferred_name: str | None = None) -> None:
         if self.on_change:
-            self.on_change()
+            self.on_change(preferred_name)
 
     def load_selected(self) -> None:
         selected = self.table.selection()
@@ -2268,6 +2285,7 @@ class CompanyManagerDialog(Toplevel):
         company = create_company(name)
         self.refresh(select_id=company["id"])
         self.company_name.set(company["name"])
+        self.notify_change(company["name"])
 
     def rename_selected(self) -> None:
         company = self.selected_company()
@@ -2283,6 +2301,7 @@ class CompanyManagerDialog(Toplevel):
             return
         self.refresh(select_id=renamed["id"])
         self.company_name.set(renamed["name"])
+        self.notify_change(renamed["name"])
 
     def delete_selected(self) -> None:
         company = self.selected_company()
@@ -2298,6 +2317,7 @@ class CompanyManagerDialog(Toplevel):
         delete_company(company["id"])
         self.company_name.set("")
         self.refresh()
+        self.notify_change()
         messagebox.showinfo("母公司已删除", f"已删除母公司：{company['name']}", parent=self)
 
 
@@ -2334,7 +2354,7 @@ class CompanyLoginView:
         self.company_combo = ttk.Combobox(form, textvariable=self.company_name, values=[], width=42)
         self.company_combo.pack(fill=X)
         self.company_combo.bind("<KeyRelease>", lambda _event: self.filter_company_combo())
-        self.company_combo.bind("<Button-1>", lambda _event: self.filter_company_combo())
+        self.company_combo.bind("<Button-1>", lambda _event: self.show_all_company_options())
         self.company_combo.bind("<Return>", lambda _event: self.login_existing())
 
         ttk.Checkbutton(self.frame, text="保持登录，下次自动进入该母公司", variable=self.remember_login).pack(anchor="w", pady=(4, 14))
@@ -2351,24 +2371,25 @@ class CompanyLoginView:
             wraplength=640,
         ).pack(anchor="w", pady=(22, 0))
         self.refresh_companies()
-        if self.companies:
-            self.company_name.set(self.companies[0]["name"])
         self.company_combo.focus_set()
 
     def destroy(self) -> None:
         self.frame.destroy()
 
-    def refresh_companies(self) -> None:
+    def refresh_companies(self, preferred_name: str | None = None) -> None:
         current_name = self.company_name.get().strip()
         self.companies = load_companies()
         self.company_by_name = {company["name"].casefold(): company for company in self.companies}
-        if current_name and current_name.casefold() not in self.company_by_name and self.companies:
-            self.company_name.set(self.companies[0]["name"])
-        self.filter_company_combo()
+        self.company_name.set(choose_login_company_name(self.companies, current_name, preferred_name))
+        self.filter_company_combo("")
 
-    def filter_company_combo(self) -> None:
+    def filter_company_combo(self, query: str | None = None) -> None:
         names = [company["name"] for company in self.companies]
-        self.company_combo.configure(values=filter_options(names, self.company_name.get(), limit=500))
+        term = self.company_name.get() if query is None else query
+        self.company_combo.configure(values=filter_options(names, term, limit=500))
+
+    def show_all_company_options(self) -> None:
+        self.filter_company_combo("")
 
     def selected_company(self) -> dict[str, str] | None:
         name = self.company_name.get().strip()

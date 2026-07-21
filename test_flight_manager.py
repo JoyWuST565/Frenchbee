@@ -13,6 +13,7 @@ from flight_manager import (
     OPTION_FIELDS,
     apply_airline_code_prefixes,
     blank_record,
+    choose_login_company_name,
     clamp_table_zoom,
     clear_login_settings,
     create_company,
@@ -265,6 +266,21 @@ class FlightScheduleDataTests(unittest.TestCase):
             self.assertIsNone(remembered_company(db_path))
             self.assertFalse(any(item["id"] == company["id"] for item in load_companies(db_path)))
             clear_login_settings(db_path)
+
+    def test_login_company_selection_after_management_changes(self) -> None:
+        alpha = {"name": "Alpha Holdings"}
+        beta = {"name": "Beta Group"}
+        gamma = {"name": "Gamma Parent"}
+        self.assertEqual(
+            choose_login_company_name([alpha, beta, gamma], "Alpha Holdings", preferred_name="Gamma Parent"),
+            "Gamma Parent",
+        )
+        self.assertEqual(
+            choose_login_company_name([alpha, gamma], "Beta Group", preferred_name="Gamma Parent"),
+            "Gamma Parent",
+        )
+        self.assertEqual(choose_login_company_name([alpha, gamma], "Beta Group"), "Alpha Holdings")
+        self.assertEqual(choose_login_company_name([], "Alpha Holdings"), "")
 
     def test_reference_option_management_allows_expected_renames(self) -> None:
         self.assertTrue(OPTION_FIELDS["aircraft_type"]["allow_rename"])
