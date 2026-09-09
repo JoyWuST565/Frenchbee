@@ -56,7 +56,7 @@ from flight_manager import (
 class FlightScheduleDataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.data = load_data()
+        cls.data = load_data(Path(__file__).with_name("flight_schedule.json"))
         cls.records = cls.data["records"]
 
     def test_imported_record_count(self) -> None:
@@ -215,14 +215,14 @@ class FlightScheduleDataTests(unittest.TestCase):
             save_ui_settings(
                 {
                     "theme_mode": "dark",
-                    "hidden_columns": ["airline", "route_pair_id"],
+                    "hidden_columns": ["aircraft_type", "weekly_frequency"],
                     "table_zoom": 130,
                 },
                 db_path,
             )
             loaded = load_ui_settings(db_path)
             self.assertEqual(loaded["theme_mode"], "dark")
-            self.assertEqual(loaded["hidden_columns"], ["airline", "route_pair_id"])
+            self.assertEqual(loaded["hidden_columns"], ["aircraft_type", "weekly_frequency"])
             self.assertEqual(loaded["table_zoom"], 130)
 
     def test_hidden_columns_and_zoom_normalization(self) -> None:
@@ -290,6 +290,8 @@ class FlightScheduleDataTests(unittest.TestCase):
     def test_complete_unpaired_record_requires_manual_pairing(self) -> None:
         record = {
             **blank_record(),
+            "departure_airport_code": "ORY",
+            "weekly_frequency": "7",
             "outbound_flight_no": "FB200",
             "return_flight_no": "FB201",
             "airport_code": "LAX",
@@ -359,7 +361,7 @@ class FlightScheduleDataTests(unittest.TestCase):
             validate_record({**record, "country_or_region": "A" * 51})
 
     def test_reference_options_include_current_sovereign_state_set(self) -> None:
-        options = load_reference_options()
+        options = load_reference_options(Path(__file__).with_name("reference_options.json"))
         countries = options["countries_or_regions"]
         self.assertEqual(len(countries), 195)
         self.assertIn("airline_codes", options)

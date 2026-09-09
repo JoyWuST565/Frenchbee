@@ -9,6 +9,7 @@ A local Python desktop tool for managing parent-company-isolated airport flight 
 - `flight_schedule.json`: legacy converted data file that can still be imported from the GUI.
 - `reference_options.json`: legacy dropdown dictionaries migrated into SQLite on first database creation.
 - `flight_manager.py`: Tkinter GUI for adding, searching, editing, deleting, and supplementing route records.
+- `flight_commands.py`: offline command parsing and country/region code lookup.
 - `test_flight_manager.py`: unit tests for import integrity, search, conflict detection, and JSON round-trip behavior.
 - `FlightRouteManager.spec`: PyInstaller build configuration for the Windows executable.
 - `flight_route_manager.ico`: desktop icon used by the app and executable.
@@ -56,6 +57,7 @@ The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedul
 - Flight numbers must be unique and use a two-character subsidiary code plus 1-4 digits.
 - Subsidiary options include a required two-character code, which is automatically prefixed to outbound and return flight numbers.
 - Airport codes must use three letters.
+- Separate departure and destination airports, plus a positive-integer weekly frequency. Legacy `airport_code` continues to mean the destination airport for SQLite and JSON compatibility.
 - Outbound departure and return arrival times are selected with separate hour and five-minute interval dropdowns.
 - Search supports subsidiary, aircraft type, country/region filtering plus exact-time and time-range filters for outbound departure and return arrival.
 - The main table collapses associated outbound/return records into one displayed route and supports three-state header sorting: ascending, descending, and default order.
@@ -78,6 +80,39 @@ The executable is created at `dist/FlightRouteManager.exe`. Keep `flight_schedul
 $env:PYTHONDONTWRITEBYTECODE='1'
 python -m unittest -v
 ```
+
+Native GUI workflow checks use an isolated test database:
+
+```powershell
+$env:RUN_FLIGHT_GUI_TESTS='1'
+python -B -m unittest -v test_flight_manager_gui
+```
+
+## 1.3 命令录入
+
+主界面顶部新增 **使用命令录入**。一行一条命令，必须依次填写以下五组数据，以空格分隔：
+
+```text
+出发机场-到达机场 往返航班号 去程离港/返程抵港 机型-班期 国家或地区代码
+PVG-CDG 9C809/10 1230/1900 A339-7 FR
+CAN-JFK 9C1239/40 0815/2200 A339-14 US
+PVG-CAN 9C1234/5 0900/1800 A339-7 D
+```
+
+- `9C809/10` 展开为 `9C809/9C810`；`9C1234/5` 展开为 `9C1234/9C1235`；`9C1239/40` 展开为 `9C1239/9C1240`。简写替换去程数字部分末尾的相应位数，也支持完整形式 `9C809/9C810`。
+- 两个机场均为三个英文字母，航班号含两位字母/数字子公司代码。小写字母自动规范化。
+- 时间必须为四位 ASCII 数字，小时 00–23、分钟 00/05/10/…/55；班期为每周班数，允许 14 等大于 7 的正整数。
+- 机型严格匹配现有名称；若机型名称包含空格，可将整个第四组加引号，如 `"Airbus A350-7"`。
+- `FR`、`US` 等代码从当前母公司的国家/地区列表匹配。未登记的子公司代码、机型或国家/地区会弹出补充登记窗口，用户确认后保存到当前母公司的选项数据。
+- `D` 不预设国家。首次使用时弹窗要求指定国家/地区；允许选择已有项或新增名称，随后保存该母公司的 `D` 对应关系。可在 **管理国家/地区 → 设为国内（D）** 中更改。
+- **识别命令** 后显示预览、错误和时间占用明细。可通过 **编辑识别结果** 修正任意字段；预览编辑不会直接写入航线数据库。修改命令文本后必须重新识别。
+- 航班号与数据库或本批次重复、缺漏或格式错误时，**确认录入** 不可用；同一出发机场的时间占用须单独确认。全部校验通过后，整批航线在一个事务中保存，每条往返航线自动获得关联 ID。
+- 补充登记的选项即时保存；航线仅在点击 **确认录入** 后保存。重命名选项时会同步更新引用它的航线名称以及 `D` 对应关系。
+- 主表默认列顺序为：去程航班号、返程航班号、出发机场、到达机场、去程离港、返程抵港、机型、班期、国家/地区。班期按数值排序，查询和导出同步支持新增字段。
+
+启动时自动为旧 SQLite 数据库增加缺少的字段。原有机场代码、航班号、关联 ID 和母公司数据保持原值；旧记录的出发机场及班期留空并提醒补录。导入旧 JSON 的空白字段不会覆盖已经填写的新字段。
+
+离线国家代码对应关系覆盖原有 195 个国家名称，并兼容部分地区及常用英文名称。代码依据 [ISO 3166 alpha-2](https://www.iso.org/iso-3166-country-codes.html)，英文名称/代码核对来源为 [Unicode CLDR territories](https://github.com/unicode-org/cldr-json/blob/main/cldr-json/cldr-localenames-full/main/en/territories.json)（2026-09-10）。程序运行时无需联网查询。
 
 ## Notes
 

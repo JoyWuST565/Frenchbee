@@ -21,6 +21,7 @@ a = Analysis(
     ],
     datas=[
         ("flight_schedule.db", "."),
+        ("reference_options.json", "."),
         ("flight_route_manager.ico", "."),
         (str(python_home / "tcl"), "tcl"),
         (str(python_lib / "tkinter"), "tkinter"),

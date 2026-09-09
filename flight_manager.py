@@ -14,9 +14,12 @@ import uuid
 import webbrowser
 import zipfile
 from contextlib import closing
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
+
+from flight_commands import COUNTRY_NAMES, default_country_code, missing_command_options, parse_command_fields
 
 
 def runtime_dir() -> Path:
@@ -63,7 +66,7 @@ Toplevel = tk.Toplevel
 
 APP_NAME = "Flight Route Management Program"
 APP_DISPLAY_NAME = "航班航线管理程序"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_AUTHOR = "JoyWuST565"
 GITHUB_URL = "https://github.com/JoyWuST565/Frenchbee"
 APP_DIR = runtime_dir()
@@ -78,7 +81,7 @@ BUNDLED_REFERENCE_OPTIONS_FILE = RESOURCE_DIR / "reference_options.json"
 REFERENCE_OPTIONS_FILE = RUNTIME_REFERENCE_OPTIONS_FILE if RUNTIME_REFERENCE_OPTIONS_FILE.exists() else BUNDLED_REFERENCE_OPTIONS_FILE
 APP_ICON_FILE = RESOURCE_DIR / "flight_route_manager.ico"
 SCHEMA_VERSION = 1
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
 DEFAULT_COMPANY_ID = "company-default"
 DEFAULT_COMPANY_NAME = "默认母公司"
 COMPANY_NAME_MAX_LENGTH = 50
@@ -94,6 +97,8 @@ DEFAULT_UI_SETTINGS = {
     "current_company_id": "",
 }
 SUPPLEMENTARY_FIELDS = (
+    "departure_airport_code",
+    "weekly_frequency",
     "outbound_flight_no",
     "return_flight_no",
     "aircraft_type",
@@ -106,10 +111,12 @@ FIELD_LABELS = {
     "airline": "子公司",
     "outbound_flight_no": "去程航班号",
     "return_flight_no": "返程航班号",
-    "airport_code": "机场代码",
+    "departure_airport_code": "出发机场代码",
+    "airport_code": "到达机场代码",
     "departure_time": "去程离港时间",
     "arrival_time": "返程抵港时间",
     "aircraft_type": "机型",
+    "weekly_frequency": "班期（班/周）",
     "country_or_region": "国家/地区",
 }
 
@@ -117,20 +124,24 @@ REQUIRED_FIELDS = (
     "airline",
     "outbound_flight_no",
     "return_flight_no",
+    "departure_airport_code",
     "airport_code",
     "departure_time",
     "arrival_time",
     "aircraft_type",
+    "weekly_frequency",
     "country_or_region",
 )
 DATA_FIELDS = (
     "id",
     "outbound_flight_no",
     "return_flight_no",
+    "departure_airport_code",
     "airport_code",
     "departure_time",
     "arrival_time",
     "aircraft_type",
+    "weekly_frequency",
     "airline",
     "country_or_region",
     "route_pair_id",
@@ -138,40 +149,40 @@ DATA_FIELDS = (
     "updated_at",
 )
 DISPLAY_COLUMNS = (
-    "status",
     "outbound_flight_no",
     "return_flight_no",
+    "departure_airport_code",
     "airport_code",
     "departure_time",
     "arrival_time",
     "aircraft_type",
-    "airline",
+    "weekly_frequency",
     "country_or_region",
-    "route_pair_id",
 )
 DISPLAY_HEADINGS = {
     "status": "状态",
     "outbound_flight_no": "去程航班号",
     "return_flight_no": "返程航班号",
-    "airport_code": "机场",
+    "departure_airport_code": "出发机场",
+    "airport_code": "到达机场",
     "departure_time": "去程离港",
     "arrival_time": "返程抵港",
     "aircraft_type": "机型",
+    "weekly_frequency": "班期",
     "airline": "子公司",
     "country_or_region": "国家/地区",
     "route_pair_id": "关联ID",
 }
 DEFAULT_COLUMN_WIDTHS = {
-    "status": 95,
     "outbound_flight_no": 100,
     "return_flight_no": 100,
-    "airport_code": 70,
+    "departure_airport_code": 85,
+    "airport_code": 85,
     "departure_time": 70,
     "arrival_time": 70,
     "aircraft_type": 90,
-    "airline": 120,
+    "weekly_frequency": 65,
     "country_or_region": 120,
-    "route_pair_id": 95,
 }
 THEME_PALETTES = {
     "light": {
@@ -212,10 +223,10 @@ THEME_PALETTES = {
     },
 }
 
-TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-SIMPLE_TIME_RE = re.compile(r"^\d{4}$")
-FLIGHT_NO_RE = re.compile(r"^[A-Z0-9]{2}\d{1,4}$")
-FLIGHT_NO_DIGITS_RE = re.compile(r"^\d{1,4}$")
+TIME_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+SIMPLE_TIME_RE = re.compile(r"^[0-9]{4}$")
+FLIGHT_NO_RE = re.compile(r"^[A-Z0-9]{2}[0-9]{1,4}$")
+FLIGHT_NO_DIGITS_RE = re.compile(r"^[0-9]{1,4}$")
 AIRLINE_CODE_RE = re.compile(r"^[A-Z0-9]{2}$")
 AIRPORT_RE = re.compile(r"^[A-Z]{3}$")
 OPTION_FIELDS = {
@@ -254,10 +265,12 @@ def blank_record() -> dict[str, str]:
         "id": f"route-{uuid.uuid4().hex[:12]}",
         "outbound_flight_no": "",
         "return_flight_no": "",
+        "departure_airport_code": "",
         "airport_code": "",
         "departure_time": "",
         "arrival_time": "",
         "aircraft_type": "",
+        "weekly_frequency": "",
         "airline": "",
         "country_or_region": "",
         "route_pair_id": "",
@@ -326,6 +339,8 @@ def load_reference_options_json(path: Path = REFERENCE_OPTIONS_FILE) -> dict:
         for config in OPTION_FIELDS.values()
     }
     options["airline_codes"] = normalize_airline_codes(options["airlines"], data.get("airline_codes", {}))
+    options["country_codes"] = normalize_country_codes(options["countries_or_regions"], data.get("country_codes", {}))
+    options["domestic_country"] = str(data.get("domestic_country", ""))
     return options
 
 
@@ -335,7 +350,20 @@ def normalized_reference_payload(options: dict) -> dict:
         for config in OPTION_FIELDS.values()
     }
     payload["airline_codes"] = normalize_airline_codes(payload["airlines"], options.get("airline_codes", {}))
+    payload["country_codes"] = normalize_country_codes(payload["countries_or_regions"], options.get("country_codes", {}))
+    domestic = str(options.get("domestic_country", "")).strip()
+    payload["domestic_country"] = domestic if domestic in payload["countries_or_regions"] else ""
     return payload
+
+
+def normalize_country_codes(names: list[str], codes: dict) -> dict[str, str]:
+    if not isinstance(codes, dict):
+        codes = {}
+    result = {}
+    for name in names:
+        code = str(codes.get(name, default_country_code(name))).strip().upper()
+        result[name] = code if re.fullmatch(r"[A-Z]{2}", code) else ""
+    return result
 
 
 def save_reference_options_json(options: dict, path: Path = REFERENCE_OPTIONS_FILE) -> None:
@@ -413,6 +441,25 @@ def create_database_schema(connection: sqlite3.Connection) -> None:
             (key, value),
         )
     migrate_company_schema(connection)
+    migrate_route_fields(connection)
+
+
+def migrate_route_fields(connection: sqlite3.Connection) -> None:
+    # Additive migration leaves every existing route, ID and association intact.
+    for field in ("departure_airport_code", "weekly_frequency"):
+        if field not in table_columns(connection, "flights"):
+            connection.execute(f"ALTER TABLE flights ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
+    if "domestic_country" not in table_columns(connection, "companies"):
+        connection.execute("ALTER TABLE companies ADD COLUMN domestic_country TEXT NOT NULL DEFAULT ''")
+    if "country_code" not in table_columns(connection, "reference_options"):
+        connection.execute("ALTER TABLE reference_options ADD COLUMN country_code TEXT NOT NULL DEFAULT ''")
+        for row in connection.execute("SELECT company_id, value FROM reference_options WHERE category = 'countries_or_regions'").fetchall():
+            code = default_country_code(row["value"])
+            if code:
+                connection.execute(
+                    "UPDATE reference_options SET country_code = ? WHERE company_id = ? AND category = 'countries_or_regions' AND value = ?",
+                    (code, row["company_id"], row["value"]),
+                )
 
 
 def sql_literal(value: str) -> str:
@@ -627,14 +674,8 @@ def write_records_to_database(connection: sqlite3.Connection, records: list[dict
     for index, record in enumerate(records):
         normalized = normalize_record(record)
         connection.execute(
-            """
-            INSERT INTO flights(
-                company_id, id, outbound_flight_no, return_flight_no, airport_code, departure_time,
-                arrival_time, aircraft_type, airline, country_or_region, route_pair_id,
-                source, updated_at, display_order
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            f"INSERT INTO flights(company_id, {', '.join(DATA_FIELDS)}, display_order) "
+            f"VALUES ({', '.join('?' for _ in range(len(DATA_FIELDS) + 2))})",
             (company_id,) + tuple(normalized[field] for field in DATA_FIELDS) + (index,),
         )
 
@@ -678,27 +719,11 @@ def upsert_records_to_database(
             normalized = merge_import_record(dict(current), normalized)
         display_order = current_order if current_order is not None else max_order + offset
         connection.execute(
-            """
-            INSERT INTO flights(
-                company_id, id, outbound_flight_no, return_flight_no, airport_code, departure_time,
-                arrival_time, aircraft_type, airline, country_or_region, route_pair_id,
-                source, updated_at, display_order
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(company_id, id) DO UPDATE SET
-                outbound_flight_no=excluded.outbound_flight_no,
-                return_flight_no=excluded.return_flight_no,
-                airport_code=excluded.airport_code,
-                departure_time=excluded.departure_time,
-                arrival_time=excluded.arrival_time,
-                aircraft_type=excluded.aircraft_type,
-                airline=excluded.airline,
-                country_or_region=excluded.country_or_region,
-                route_pair_id=excluded.route_pair_id,
-                source=excluded.source,
-                updated_at=excluded.updated_at,
-                display_order=excluded.display_order
-            """,
+            f"INSERT INTO flights(company_id, {', '.join(DATA_FIELDS)}, display_order) "
+            f"VALUES ({', '.join('?' for _ in range(len(DATA_FIELDS) + 2))}) "
+            "ON CONFLICT(company_id, id) DO UPDATE SET "
+            + ', '.join(f"{field}=excluded.{field}" for field in DATA_FIELDS if field != "id")
+            + ", display_order=excluded.display_order",
             (company_id,) + tuple(normalized[field] for field in DATA_FIELDS) + (display_order,),
         )
         imported += 1
@@ -709,13 +734,16 @@ def write_reference_options_to_database(connection: sqlite3.Connection, options:
     payload = normalized_reference_payload(options)
     connection.execute("DELETE FROM reference_options WHERE company_id = ?", (company_id,))
     airline_codes = payload.get("airline_codes", {})
+    country_codes = payload.get("country_codes", {})
     for field, config in OPTION_FIELDS.items():
         category = config["category"]
         for index, value in enumerate(payload.get(category, [])):
             connection.execute(
-                "INSERT INTO reference_options(company_id, category, value, airline_code, display_order) VALUES (?, ?, ?, ?, ?)",
-                (company_id, category, value, airline_codes.get(value, "") if field == "airline" else "", index),
+                "INSERT INTO reference_options(company_id, category, value, airline_code, country_code, display_order) VALUES (?, ?, ?, ?, ?, ?)",
+                (company_id, category, value, airline_codes.get(value, "") if field == "airline" else "",
+                 country_codes.get(value, "") if field == "country_or_region" else "", index),
             )
+    connection.execute("UPDATE companies SET domestic_country = ? WHERE id = ?", (payload["domestic_country"], company_id))
 
 
 def create_database_from_payload(
@@ -971,38 +999,36 @@ def load_reference_options(path: Path = DB_FILE, company_id: str = DEFAULT_COMPA
     if not is_database_path(path):
         return load_reference_options_json(path)
     ensure_database(path)
-    options = {config["category"]: [] for config in OPTION_FIELDS.values()}
-    airline_codes: dict[str, str] = {}
     with closing(connect_database(path)) as connection:
         seed_reference_options_for_company(connection, company_id)
         connection.commit()
-        for row in connection.execute(
-            "SELECT category, value, airline_code FROM reference_options WHERE company_id = ? ORDER BY display_order, value",
-            (company_id,),
-        ):
-            category = row["category"]
-            value = row["value"]
-            if category in options:
-                options[category].append(value)
-                if category == OPTION_FIELDS["airline"]["category"] and row["airline_code"]:
-                    airline_codes[value] = row["airline_code"]
-    options = {
-        config["category"]: normalize_options(options.get(config["category"], []), config["max_length"])
-        for config in OPTION_FIELDS.values()
-    }
-    options["airline_codes"] = normalize_airline_codes(options["airlines"], airline_codes)
-    return options
+        return read_reference_options(connection, company_id)
+
+
+def read_reference_options(connection: sqlite3.Connection, company_id: str) -> dict:
+    options = {config["category"]: [] for config in OPTION_FIELDS.values()}
+    options.update(airline_codes={}, country_codes={}, domestic_country="")
+    for row in connection.execute(
+        "SELECT category, value, airline_code, country_code FROM reference_options WHERE company_id = ? ORDER BY display_order, value",
+        (company_id,),
+    ):
+        category, value = row["category"], row["value"]
+        if category in OPTION_CATEGORIES:
+            options[category].append(value)
+        if category == "airlines":
+            options["airline_codes"][value] = row["airline_code"]
+        elif category == "countries_or_regions":
+            options["country_codes"][value] = row["country_code"]
+    company = connection.execute("SELECT domestic_country FROM companies WHERE id = ?", (company_id,)).fetchone()
+    options["domestic_country"] = company["domestic_country"] if company else ""
+    return normalized_reference_payload(options)
 
 
 def save_reference_options(options: dict, path: Path = DB_FILE, company_id: str = DEFAULT_COMPANY_ID) -> None:
     if not is_database_path(path):
         save_reference_options_json(options, path)
         return
-    payload = {
-        config["category"]: normalize_options(options.get(config["category"], []), config["max_length"])
-        for config in OPTION_FIELDS.values()
-    }
-    payload["airline_codes"] = normalize_airline_codes(payload["airlines"], options.get("airline_codes", {}))
+    payload = normalized_reference_payload(options)
     ensure_database(path)
     with closing(connect_database(path)) as connection:
         write_reference_options_to_database(connection, payload, company_id)
@@ -1017,6 +1043,12 @@ def filter_options(values: list[str], term: str, limit: int | None = 80) -> list
     contains = [value for value in values if term in value.casefold() and value not in starts]
     results = starts + contains
     return results if limit is None else results[:limit]
+
+
+def dropdown_options(values: list[str], current: str) -> list[str]:
+    # A completed selection should not hide all alternative choices when reopening.
+    query = "" if current.strip().casefold() in {value.casefold() for value in values} else current
+    return filter_options(values, query, limit=None)
 
 
 def normalize_theme_mode(value: str) -> str:
@@ -1126,7 +1158,7 @@ def normalize_time(value: str) -> str:
         if hour > 23 or minute > 59:
             raise ValueError("简易时间必须为 0000 到 2359 之间的四位数字。")
         return f"{hour:02d}:{minute:02d}"
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", value)
+    match = re.fullmatch(r"([0-9]{1,2}):([0-9]{2})(?::[0-9]{2})?", value)
     if not match:
         raise ValueError("时间格式应为 HH:MM 或四位数字，例如 08:30 或 0815。")
     hour = int(match.group(1))
@@ -1143,6 +1175,9 @@ def normalize_record(record: dict) -> dict[str, str]:
     normalized["outbound_flight_no"] = normalized["outbound_flight_no"].strip().upper()
     normalized["return_flight_no"] = normalized["return_flight_no"].strip().upper()
     normalized["airport_code"] = normalized["airport_code"].strip().upper()
+    normalized["departure_airport_code"] = normalized["departure_airport_code"].strip().upper()
+    frequency = normalized["weekly_frequency"].strip()
+    normalized["weekly_frequency"] = (frequency.lstrip("0") or "0") if re.fullmatch(r"[0-9]+", frequency) else frequency
     normalized["departure_time"] = normalize_time(normalized["departure_time"])
     normalized["arrival_time"] = normalize_time(normalized["arrival_time"])
     normalized["aircraft_type"] = normalized["aircraft_type"].strip()
@@ -1184,9 +1219,13 @@ def validate_record(record: dict[str, str]) -> None:
         flight_no = record.get(field, "").strip().upper()
         if flight_no and not FLIGHT_NO_RE.fullmatch(flight_no):
             raise ValueError(f"{FIELD_LABELS[field]}应由两位子公司代码和 1 至 4 位数字组成，例如 BF1、9C101、G51001。")
-    airport_code = record.get("airport_code", "").strip().upper()
-    if airport_code and not AIRPORT_RE.fullmatch(airport_code):
-        raise ValueError("机场代码应为三个英文字母，例如 RUN、JFK。")
+    for field in ("departure_airport_code", "airport_code"):
+        airport_code = record.get(field, "").strip().upper()
+        if airport_code and not AIRPORT_RE.fullmatch(airport_code):
+            raise ValueError(f"{FIELD_LABELS[field]}应为三个英文字母，例如 PVG、JFK。")
+    frequency = str(record.get("weekly_frequency", "")).strip()
+    if frequency and (not re.fullmatch(r"[0-9]+", frequency) or not frequency.strip("0")):
+        raise ValueError("班期必须为正整数，表示每周执行的班数，例如 7、14。")
     for field, config in OPTION_FIELDS.items():
         if len(record.get(field, "")) > config["max_length"]:
             raise ValueError(f"{FIELD_LABELS[field]}长度不能超过 {config['max_length']} 个字符。")
@@ -1240,7 +1279,7 @@ def find_duplicate_flight_numbers(
 
 def record_summary(record: dict[str, str]) -> str:
     flight_no = "/".join(part for part in (record.get("outbound_flight_no"), record.get("return_flight_no")) if part) or "未录入航班号"
-    airport = record.get("airport_code") or "未录入机场"
+    airport = f"{record.get('departure_airport_code') or '?'}-{record.get('airport_code') or '?'}"
     departure = record.get("departure_time") or "-"
     arrival = record.get("arrival_time") or "-"
     return f"{flight_no} | {airport} | 去程离港 {departure} | 返程抵港 {arrival}"
@@ -1272,6 +1311,7 @@ def time_in_range(value: str, start: str, end: str) -> bool:
 def record_matches_criteria(record: dict[str, str], criteria: dict[str, str]) -> bool:
     flight_no = criteria.get("flight_no", "").strip().upper()
     airport_code = criteria.get("airport_code", "").strip().upper()
+    departure_airport_code = criteria.get("departure_airport_code", "").strip().upper()
     airline = criteria.get("airline", "").strip().casefold()
     aircraft_type = criteria.get("aircraft_type", "").strip().casefold()
     country_or_region = criteria.get("country_or_region", "").strip().casefold()
@@ -1285,6 +1325,8 @@ def record_matches_criteria(record: dict[str, str], criteria: dict[str, str]) ->
     if flight_no and flight_no not in {record.get("outbound_flight_no", "").upper(), record.get("return_flight_no", "").upper()}:
         return False
     if airport_code and airport_code != record.get("airport_code", "").upper():
+        return False
+    if departure_airport_code and departure_airport_code != record.get("departure_airport_code", "").upper():
         return False
     if airline and airline != record.get("airline", "").strip().casefold():
         return False
@@ -1377,6 +1419,8 @@ def group_row_id(group: list[dict[str, str]]) -> str:
 def sort_display_groups(groups: list[list[dict[str, str]]], column: str | None, direction: str | None) -> list[list[dict[str, str]]]:
     if not column or direction not in {"asc", "desc"}:
         return groups
+    if column == "weekly_frequency":
+        return sorted(groups, key=lambda group: tuple((len(value), value) for value in group_unique_values(group, column)), reverse=direction == "desc")
     return sorted(
         groups,
         key=lambda group: (not group_display_value(group, column), group_display_value(group, column).casefold()),
@@ -1417,8 +1461,15 @@ def same_airport_candidates(records: list[dict[str, str]], source: dict[str, str
     return [
         record
         for record in records
-        if record.get("id") != source.get("id") and record.get("airport_code") == airport_code
+        if record.get("id") != source.get("id") and airports_compatible(source, record)
     ]
+
+
+def airports_compatible(left: dict[str, str], right: dict[str, str]) -> bool:
+    if not left.get("airport_code") or left.get("airport_code") != right.get("airport_code"):
+        return False
+    origin_left, origin_right = left.get("departure_airport_code"), right.get("departure_airport_code")
+    return not origin_left or not origin_right or origin_left == origin_right
 
 
 def strong_pair_candidates(records: list[dict[str, str]], source: dict[str, str], original: dict[str, str] | None = None) -> list[dict[str, str]]:
@@ -1453,6 +1504,9 @@ def find_time_conflicts(records: list[dict[str, str]], candidate: dict[str, str]
     for record in records:
         if exclude_id and record.get("id") == exclude_id:
             continue
+        origin, other_origin = candidate.get("departure_airport_code"), record.get("departure_airport_code")
+        if origin and other_origin and origin != other_origin:
+            continue
         if departure_time and record.get("departure_time") == departure_time:
             conflicts.append({"type": "去程离港", "time": departure_time, "record": record})
         if arrival_time and record.get("arrival_time") == arrival_time:
@@ -1473,9 +1527,7 @@ def load_data(path: Path = DB_FILE, company_id: str = DEFAULT_COMPANY_ID) -> dic
             normalize_record(dict(row))
             for row in connection.execute(
                 """
-                SELECT id, outbound_flight_no, return_flight_no, airport_code,
-                       departure_time, arrival_time, aircraft_type, airline,
-                       country_or_region, route_pair_id, source, updated_at
+                SELECT *
                 FROM flights
                 WHERE company_id = ?
                 ORDER BY display_order, id
@@ -1515,6 +1567,134 @@ def import_json_records_to_database(json_path: Path, db_path: Path = DB_FILE, co
         imported = upsert_records_to_database(connection, records, preserve_existing_on_blank=True, company_id=company_id)
         connection.commit()
         return imported
+
+
+@dataclass
+class CommandDraft:
+    line_number: int
+    command: str
+    record: dict[str, str]
+    parse_errors: list[str] = dataclass_field(default_factory=list)
+
+
+def recognize_commands(text: str, options: dict) -> list[CommandDraft]:
+    drafts = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.strip():
+            fields, errors = parse_command_fields(line, options)
+            record = normalize_record({**blank_record(), **fields, "source": "command"})
+            drafts.append(CommandDraft(number, line, record, errors))
+    return drafts
+
+
+def validate_record_options(record: dict[str, str], options: dict) -> None:
+    for field, config in OPTION_FIELDS.items():
+        value = record.get(field, "").strip()
+        if value and value not in options.get(config["category"], []):
+            raise ValueError(f"{FIELD_LABELS[field]}必须从现有列表中选择，请先登记该选项。")
+    apply_airline_code_prefixes(dict(record), options.get("airline_codes", {}))
+
+
+def validate_command_drafts(
+    drafts: list[CommandDraft], existing: list[dict[str, str]], options: dict,
+) -> tuple[dict[int, list[str]], dict[int, list[str]]]:
+    errors, warnings = {}, {}
+    for index, draft in enumerate(drafts):
+        problems = list(draft.parse_errors)
+        record = draft.record
+        missing = missing_fields(record)
+        if missing:
+            problems.append("缺失：" + "、".join(FIELD_LABELS[field] for field in missing))
+        try:
+            validate_record(record)
+            validate_record_options(record, options)
+            if not options.get("airline_codes", {}).get(record.get("airline", "")):
+                raise ValueError("所选子公司尚未登记二字代码。")
+            for time_field in ("departure_time", "arrival_time"):
+                if record.get(time_field) not in TIME_OPTIONS:
+                    raise ValueError(f"{FIELD_LABELS[time_field]}必须是每 5 分钟一个间隔的有效时间。")
+        except ValueError as exc:
+            problems.append(str(exc))
+        duplicates = find_duplicate_flight_numbers(existing, record)
+        for duplicate in duplicates:
+            problems.append(f"航班号 {duplicate['flight_no']} 重复：{record_summary(duplicate['record'])}")
+        for other in drafts[:index] + drafts[index + 1:]:
+            for duplicate in find_duplicate_flight_numbers([other.record], record):
+                problems.append(f"航班号 {duplicate['flight_no']} 与命令第 {other.line_number} 行重复。")
+        errors[draft.line_number] = list(dict.fromkeys(problems))
+        conflicts = []
+        if not problems:
+            for conflict in find_time_conflicts(existing, record):
+                conflicts.append(f"{conflict['type']} {conflict['time']} 已占用：{record_summary(conflict['record'])} [{conflict['record']['id']}]")
+            for other in drafts[:index] + drafts[index + 1:]:
+                for conflict in find_time_conflicts([other.record], record):
+                    conflicts.append(f"{conflict['type']} {conflict['time']} 与命令第 {other.line_number} 行时间相同。")
+        warnings[draft.line_number] = list(dict.fromkeys(conflicts))
+    return errors, warnings
+
+
+def command_messages(messages: dict[int, list[str]]) -> list[str]:
+    return [f"第 {number} 行：{message}" for number, items in messages.items() for message in items]
+
+
+def register_command_option(options: dict, field: str, token: str, name: str) -> dict:
+    config = OPTION_FIELDS[field]
+    name = name.strip()
+    if not name or len(name) > config["max_length"]:
+        raise ValueError(f"{config['label']}名称不能为空，且不能超过 {config['max_length']} 个字符。")
+    result = copy.deepcopy(options)
+    names = result.setdefault(config["category"], [])
+    existing = next((value for value in names if value.casefold() == name.casefold()), None)
+    name = existing or name
+    if field == "aircraft_type" and name.casefold() != token.casefold():
+        raise ValueError(f"机型名称须与命令中的“{token}”一致。若需使用其他名称，请修改命令或编辑识别结果。")
+    if field in {"airline", "country_or_region"}:
+        key = "airline_codes" if field == "airline" else "country_codes"
+        codes = result.setdefault(key, {})
+        token = token.upper()
+        if field == "country_or_region" and token == "D":
+            result["domestic_country"] = name
+            codes.setdefault(name, default_country_code(name))
+        else:
+            pattern = AIRLINE_CODE_RE if field == "airline" else re.compile(r"[A-Z]{2}")
+            if not pattern.fullmatch(token):
+                raise ValueError("二字代码格式无效。")
+            if codes.get(name) and codes[name] != token:
+                raise ValueError(f"“{name}”已使用代码 {codes[name]}，不能直接覆盖为 {token}。请在管理窗口修改或选择其他名称。")
+            if any(value == token and item != name for item, value in codes.items()):
+                raise ValueError(f"代码 {token} 已被其他名称占用，请检查现有列表。")
+            codes[name] = token
+    if not existing:
+        names.append(name)
+    return normalized_reference_payload(result)
+
+
+def commit_command_drafts(
+    drafts: list[CommandDraft], company_id: str, path: Path = DB_FILE,
+    accepted_warnings: set[str] | None = None,
+) -> int:
+    if not drafts:
+        raise ValueError("没有可录入的命令。")
+    ensure_database(path)
+    with closing(connect_database(path)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if not connection.execute("SELECT 1 FROM companies WHERE id = ?", (company_id,)).fetchone():
+            raise ValueError("当前母公司不存在，请重新登录。")
+        existing = [normalize_record(dict(row)) for row in connection.execute("SELECT * FROM flights WHERE company_id = ? ORDER BY display_order, id", (company_id,))]
+        options = read_reference_options(connection, company_id)
+        errors, warnings = validate_command_drafts(drafts, existing, options)
+        if any(errors.values()):
+            raise ValueError("录入校验未通过：\n" + "\n".join(command_messages(errors)))
+        if set(command_messages(warnings)) - (accepted_warnings or set()):
+            raise ValueError("存在尚未确认的时间占用，请重新检查预览中的警示。")
+        max_order = connection.execute("SELECT COALESCE(MAX(display_order), -1) FROM flights WHERE company_id = ?", (company_id,)).fetchone()[0]
+        for index, draft in enumerate(drafts, 1):
+            record = normalize_record({**draft.record, "id": blank_record()["id"], "route_pair_id": new_pair_id(), "source": "command", "updated_at": now_iso()})
+            connection.execute(
+                f"INSERT INTO flights(company_id, {', '.join(DATA_FIELDS)}, display_order) VALUES ({', '.join('?' for _ in range(len(DATA_FIELDS) + 2))})",
+                (company_id,) + tuple(record[key] for key in DATA_FIELDS) + (max_order + index,),
+            )
+    return len(drafts)
 
 
 def column_letter(index: int) -> str:
@@ -1634,6 +1814,7 @@ class OptionManagerDialog(Toplevel):
         self.field = field
         self.config_info = OPTION_FIELDS[field]
         self.category = self.config_info["category"]
+        self.code_key = {"airline": "airline_codes", "country_or_region": "country_codes"}.get(field)
         self.on_change = on_change
         self.search_text = StringVar()
         self.value_text = StringVar()
@@ -1655,14 +1836,19 @@ class OptionManagerDialog(Toplevel):
         search_entry.bind("<KeyRelease>", lambda _event: self.refresh())
         ttk.Button(top, text="清空", command=self.clear_search).pack(side=LEFT, padx=(8, 0))
 
-        table_columns = ("value", "code") if self.field == "airline" else ("value",)
-        self.table = ttk.Treeview(body, columns=table_columns, show="headings", selectmode="browse")
+        table_columns = ("value", "code") if self.code_key else ("value",)
+        table_frame = ttk.Frame(body)
+        table_frame.pack(fill=BOTH, expand=True, pady=(0, 10))
+        self.table = ttk.Treeview(table_frame, columns=table_columns, show="headings", selectmode="browse")
         self.table.heading("value", text=self.config_info["label"])
-        self.table.column("value", anchor="w", width=350 if self.field == "airline" else 460)
-        if self.field == "airline":
-            self.table.heading("code", text="子公司代码")
+        self.table.column("value", anchor="w", width=350 if self.code_key else 460)
+        if self.code_key:
+            self.table.heading("code", text="子公司代码" if field == "airline" else "国家/地区代码")
             self.table.column("code", anchor="center", width=90)
-        self.table.pack(fill=BOTH, expand=True, pady=(0, 10))
+        scrollbar = ttk.Scrollbar(table_frame, orient=VERTICAL, command=self.table.yview)
+        self.table.configure(yscrollcommand=scrollbar.set)
+        self.table.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
         self.table.bind("<<TreeviewSelect>>", lambda _event: self.load_selected())
 
         form = ttk.Frame(body)
@@ -1677,10 +1863,10 @@ class OptionManagerDialog(Toplevel):
         )
         value_entry.pack(side=LEFT, fill=X, expand=True)
 
-        if self.field == "airline":
+        if self.code_key:
             code_form = ttk.Frame(body)
             code_form.pack(fill=X, pady=(8, 0))
-            ttk.Label(code_form, text="子公司二字代码").pack(side=LEFT, padx=(0, 6))
+            ttk.Label(code_form, text="子公司二字代码" if field == "airline" else "国家/地区二字代码").pack(side=LEFT, padx=(0, 6))
             code_entry = ttk.Entry(
                 code_form,
                 textvariable=self.code_text,
@@ -1689,7 +1875,14 @@ class OptionManagerDialog(Toplevel):
                 validatecommand=(self.register(self.limit_airline_code), "%P"),
             )
             code_entry.pack(side=LEFT)
-            ttk.Label(code_form, text="仅限两位大写字母或数字，如 BF、9C、G5、23", style="Muted.TLabel").pack(side=LEFT, padx=(8, 0))
+            ttk.Label(code_form, text="两位字母或数字" if field == "airline" else "两位英文字母，如 FR、US；可留空", style="Muted.TLabel").pack(side=LEFT, padx=(8, 0))
+
+        if field == "country_or_region":
+            self.domestic_text = StringVar(value=self.domestic_label())
+            domestic_bar = ttk.Frame(body)
+            domestic_bar.pack(fill=X, pady=(8, 0))
+            ttk.Label(domestic_bar, textvariable=self.domestic_text).pack(side=LEFT)
+            ttk.Button(domestic_bar, text="设为国内（D）", command=self.set_domestic).pack(side=RIGHT)
 
         buttons = ttk.Frame(body)
         buttons.pack(fill=X, pady=(10, 0))
@@ -1721,8 +1914,8 @@ class OptionManagerDialog(Toplevel):
         for index, value in enumerate(filter_options(self.values(), self.search_text.get(), limit=500)):
             item_id = f"item-{index}"
             self.item_values[item_id] = value
-            if self.field == "airline":
-                self.table.insert("", END, iid=item_id, values=(value, self.app.airline_code_for(value)))
+            if self.code_key:
+                self.table.insert("", END, iid=item_id, values=(value, self.app.options.get(self.code_key, {}).get(value, "")))
             else:
                 self.table.insert("", END, iid=item_id, values=(value,))
 
@@ -1731,8 +1924,19 @@ class OptionManagerDialog(Toplevel):
         if selected:
             value = self.item_values.get(selected[0], "")
             self.value_text.set(value)
-            if self.field == "airline":
-                self.code_text.set(self.app.airline_code_for(value))
+            if self.code_key:
+                self.code_text.set(self.app.options.get(self.code_key, {}).get(value, ""))
+
+    def domestic_label(self) -> str:
+        return "国内（D）：" + (self.app.options.get("domestic_country") or "未设置")
+
+    def set_domestic(self) -> None:
+        selected = self.table.selection()
+        if not selected:
+            messagebox.showinfo("请选择国家/地区", "请先选择要作为国内（D）的国家/地区。", parent=self)
+            return
+        self.app.options["domestic_country"] = self.item_values[selected[0]]
+        self.persist()
 
     def validate_new_value(self, value: str) -> str | None:
         value = value.strip()
@@ -1747,7 +1951,16 @@ class OptionManagerDialog(Toplevel):
             return None
         return value
 
-    def validate_airline_code_value(self) -> str | None:
+    def validate_airline_code_value(self, editing_name: str = "") -> str | None:
+        if self.field == "country_or_region":
+            value = self.code_text.get().strip().upper()
+            if value and not re.fullmatch(r"[A-Z]{2}", value):
+                messagebox.showerror("国家/地区代码有误", "请输入两位英文字母，例如 FR、US，或留空。", parent=self)
+                return None
+            if value and any(code == value and name != editing_name for name, code in self.app.options.get("country_codes", {}).items()):
+                messagebox.showerror("国家/地区代码重复", "该代码已对应其他国家/地区，请修改。", parent=self)
+                return None
+            return value
         if self.field != "airline":
             return ""
         if not self.code_text.get().strip():
@@ -1759,9 +1972,19 @@ class OptionManagerDialog(Toplevel):
             messagebox.showerror("子公司代码有误", str(exc), parent=self)
             return None
 
-    def persist(self) -> None:
+    def persist(self, save_records: bool = False) -> None:
         self.app.options[self.category] = normalize_options(self.app.options.get(self.category, []), self.config_info["max_length"])
-        save_reference_options(self.app.options, company_id=self.app.company["id"])
+        if save_records:
+            ensure_database()
+            with closing(connect_database()) as connection, connection:
+                write_reference_options_to_database(connection, self.app.options, self.app.company["id"])
+                write_records_to_database(connection, self.app.records, self.app.company["id"])
+            self.app.data["records"] = self.app.records
+            self.app.refresh()
+        else:
+            save_reference_options(self.app.options, company_id=self.app.company["id"])
+        if self.field == "country_or_region":
+            self.domestic_text.set(self.domestic_label())
         self.refresh()
         self.app.refresh_search_option_combos()
         if self.on_change:
@@ -1775,8 +1998,8 @@ class OptionManagerDialog(Toplevel):
         if code is None:
             return
         self.app.options.setdefault(self.category, []).append(value)
-        if self.field == "airline":
-            self.app.options.setdefault("airline_codes", {})[value] = code
+        if self.code_key:
+            self.app.options.setdefault(self.code_key, {})[value] = code
         self.persist()
         self.value_text.set(value)
 
@@ -1798,15 +2021,21 @@ class OptionManagerDialog(Toplevel):
             new_value = self.validate_new_value(new_value)
         if not new_value:
             return
-        code = self.validate_airline_code_value()
+        code = self.validate_airline_code_value(editing_name=old_value)
         if code is None:
             return
         values = [new_value if value == old_value else value for value in self.values()]
         self.app.options[self.category] = values
-        if self.field == "airline":
-            self.app.options.setdefault("airline_codes", {}).pop(old_value, None)
-            self.app.options.setdefault("airline_codes", {})[new_value] = code
-        self.persist()
+        if self.code_key:
+            self.app.options.setdefault(self.code_key, {}).pop(old_value, None)
+            self.app.options.setdefault(self.code_key, {})[new_value] = code
+        if self.field == "country_or_region" and self.app.options.get("domestic_country") == old_value:
+            self.app.options["domestic_country"] = new_value
+        for record in self.app.records:
+            if record.get(self.field) == old_value:
+                record[self.field] = new_value
+                record["updated_at"] = now_iso()
+        self.persist(save_records=True)
         self.value_text.set(new_value)
 
     def delete_selected(self) -> None:
@@ -1835,21 +2064,24 @@ class OptionManagerDialog(Toplevel):
         ):
             return
         self.app.options[self.category] = [item for item in self.values() if item != value]
-        if self.field == "airline":
-            self.app.options.setdefault("airline_codes", {}).pop(value, None)
+        if self.code_key:
+            self.app.options.setdefault(self.code_key, {}).pop(value, None)
             self.code_text.set("")
-        self.persist()
+        if self.field == "country_or_region" and self.app.options.get("domestic_country") == value:
+            self.app.options["domestic_country"] = ""
         if linked_delete_ids:
             self.app.records = [record for record in self.app.records if record.get("id") not in linked_delete_ids]
-            self.app.persist_and_refresh()
+        self.persist(save_records=bool(linked_delete_ids))
         self.value_text.set("")
 
 
 class FlightEditor(Toplevel):
-    def __init__(self, app: "FlightManagerApp", record: dict[str, str] | None = None, focus_field: str | None = None):
-        super().__init__(app.root)
+    def __init__(self, app: "FlightManagerApp", record: dict[str, str] | None = None, focus_field: str | None = None, *, on_save=None, parent=None):
+        super().__init__(parent or app.root)
         self.app = app
-        self.original_id = record.get("id") if record else None
+        self.on_save = on_save
+        self.dialog_parent = parent
+        self.original_id = record.get("id") if record and on_save is None else None
         self.record = copy.deepcopy(record) if record else blank_record()
         self.entries: dict[str, Entry] = {}
         self.option_combos: dict[str, ttk.Combobox] = {}
@@ -1859,9 +2091,9 @@ class FlightEditor(Toplevel):
         self.field_widgets: dict[str, object] = {}
         self.readonly_fields: set[str] = set()
         self.supplement_mode = bool(self.original_id and missing_fields(self.record))
-        self.title("编辑航线" if record else "新增航线")
+        self.title("编辑识别结果" if on_save else "编辑航线" if record else "新增航线")
         self.resizable(False, False)
-        self.transient(app.root)
+        self.transient(parent or app.root)
         self.grab_set()
 
         body = ttk.Frame(self, padding=16)
@@ -1899,6 +2131,8 @@ class FlightEditor(Toplevel):
                 entry.grid(row=row, column=1, sticky="we", pady=5)
                 self.entries[field] = entry
                 self.field_widgets[field] = entry
+                if field == "weekly_frequency":
+                    entry.configure(validate="key", validatecommand=(self.register(lambda value: not value or re.fullmatch(r"[0-9]+", value) is not None), "%P"))
 
         button_bar = ttk.Frame(body)
         button_bar.grid(row=len(REQUIRED_FIELDS) + 1 + row_offset, column=0, columnspan=3, sticky="e", pady=(14, 0))
@@ -1948,7 +2182,7 @@ class FlightEditor(Toplevel):
             parent,
             textvariable=variable,
             width=27,
-            values=filter_options(self.app.option_values_for_field(field), variable.get(), limit=500),
+            values=dropdown_options(self.app.option_values_for_field(field), variable.get()),
             validate="key",
             validatecommand=(self.register(lambda value, limit=config["max_length"]: len(value) <= limit), "%P"),
         )
@@ -1966,14 +2200,17 @@ class FlightEditor(Toplevel):
 
     def filter_option_combo(self, field: str) -> None:
         combo = self.option_combos[field]
-        combo.configure(values=filter_options(self.app.option_values_for_field(field), combo.get(), limit=500))
+        combo.configure(values=dropdown_options(self.app.option_values_for_field(field), combo.get()))
 
     def refresh_option_combos(self) -> None:
         for field in self.option_combos:
             self.filter_option_combo(field)
 
     def open_option_manager(self, field: str) -> None:
-        OptionManagerDialog(self.app, field, on_change=self.refresh_option_combos)
+        dialog = OptionManagerDialog(self.app, field, on_change=self.refresh_option_combos)
+        self.wait_window(dialog)
+        if self.winfo_exists():
+            self.grab_set()
 
     def on_airline_selected(self) -> None:
         airline = self.option_combos.get("airline").get().strip() if "airline" in self.option_combos else ""
@@ -2000,7 +2237,9 @@ class FlightEditor(Toplevel):
         minute = minute_combo.get().strip()
         if not hour and not minute:
             return ""
-        if hour not in HOUR_OPTIONS or minute not in MINUTE_OPTIONS:
+        original_time = self.record.get(field, "")
+        preserve_original = bool(self.original_id and f"{hour}:{minute}" == original_time)
+        if hour not in HOUR_OPTIONS or (minute not in MINUTE_OPTIONS and not preserve_original):
             raise ValueError(f"{FIELD_LABELS[field]}必须从小时 00-23 和分钟 00-55 的下拉列表中选择。")
         return f"{hour}:{minute}"
 
@@ -2040,6 +2279,13 @@ class FlightEditor(Toplevel):
                 parent=self,
             )
             self.focus_editor_field(first_missing)
+            return
+
+        if self.on_save:
+            self.on_save(record)
+            self.destroy()
+            if self.dialog_parent and self.dialog_parent.winfo_exists():
+                self.dialog_parent.grab_set()
             return
 
         if not self.original_id and route_info_complete(record) and not record.get("route_pair_id"):
@@ -2095,6 +2341,258 @@ class FlightEditor(Toplevel):
             messagebox.showwarning("待关联提醒", "该航线资料已完整，请继续手动关联对应的去程或返程航班。", parent=self)
         elif show_counterpart_prompt:
             self.app.show_counterpart_prompt(record["id"], parent=self)
+        self.destroy()
+
+
+class CommandReferenceDialog(Toplevel):
+    def __init__(self, parent, app, field: str, token: str, suggested_name: str):
+        super().__init__(parent)
+        self.app, self.field, self.token = app, field, token
+        self.saved = False
+        self.title("补充登记" + FIELD_LABELS[field])
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill=BOTH, expand=True)
+        label = f"命令中的 {token} 尚未登记。"
+        if field == "country_or_region" and token == "D":
+            label = "请指定当前母公司国内航班（D）对应的国家/地区。"
+        ttk.Label(body, text=label, wraplength=440, style="Warning.TLabel").pack(anchor="w", pady=(0, 12))
+        ttk.Label(body, text=FIELD_LABELS[field] + "名称").pack(anchor="w")
+        self.name_var = StringVar(value=suggested_name)
+        config = OPTION_FIELDS[field]
+        self.name_combo = ttk.Combobox(body, textvariable=self.name_var, width=46, values=app.options.get(config["category"], []))
+        self.name_combo.pack(fill=X, pady=(4, 12))
+        self.name_combo.configure(validate="key", validatecommand=(self.register(lambda value: len(value) <= config["max_length"]), "%P"))
+        self.name_combo.configure(postcommand=lambda: self.name_combo.configure(values=dropdown_options(app.options.get(config["category"], []), self.name_var.get())))
+        self.name_combo.bind("<KeyRelease>", lambda _event: self.name_combo.configure(values=filter_options(app.options.get(config["category"], []), self.name_var.get(), limit=None)))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=X)
+        ttk.Button(buttons, text="保存登记", command=self.save).pack(side=LEFT)
+        ttk.Button(buttons, text="稍后修正", command=self.destroy).pack(side=RIGHT)
+        self.name_combo.focus_set()
+
+    def save(self) -> None:
+        try:
+            current = load_reference_options(company_id=self.app.company["id"])
+            options = register_command_option(current, self.field, self.token, self.name_var.get())
+            save_reference_options(options, company_id=self.app.company["id"])
+        except (ValueError, OSError, sqlite3.Error, DatabaseStartupError) as exc:
+            messagebox.showerror("登记未完成", str(exc), parent=self)
+            return
+        self.app.options = options
+        self.app.refresh_search_option_combos()
+        self.saved = True
+        self.destroy()
+
+
+class CommandEntryDialog(Toplevel):
+    def __init__(self, app: "FlightManagerApp"):
+        super().__init__(app.root)
+        self.app = app
+        self.drafts: list[CommandDraft] = []
+        self.errors: dict[int, list[str]] = {}
+        self.warnings: dict[int, list[str]] = {}
+        self.accepted_warnings: set[str] = set()
+        self.recognized_text: str | None = None
+        self.saved = False
+        self.title("使用命令录入")
+        self.geometry("1160x720")
+        self.minsize(900, 580)
+        self.transient(app.root)
+        self.grab_set()
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill=BOTH, expand=True)
+        ttk.Label(body, text="命令（每行一条）").pack(anchor="w")
+        ttk.Label(body, text="PVG-CDG 9C809/10 1230/1900 A339-7 FR", style="Muted.TLabel").pack(anchor="w", pady=(4, 6))
+        palette = app.palette()
+        input_frame = ttk.Frame(body)
+        input_frame.pack(fill=X)
+        self.command_text = tk.Text(input_frame, height=5, wrap="none", undo=True, background=palette["field"], foreground=palette["text"], insertbackground=palette["text"], font=("Consolas", 11))
+        self.command_text.grid(row=0, column=0, sticky="nsew")
+        command_scroll = ttk.Scrollbar(input_frame, orient="horizontal", command=self.command_text.xview)
+        command_scroll.grid(row=1, column=0, sticky="ew")
+        command_yscroll = ttk.Scrollbar(input_frame, orient=VERTICAL, command=self.command_text.yview)
+        command_yscroll.grid(row=0, column=1, sticky="ns")
+        input_frame.columnconfigure(0, weight=1)
+        self.command_text.configure(xscrollcommand=command_scroll.set, yscrollcommand=command_yscroll.set)
+        self.command_text.bind("<<Modified>>", self.commands_changed)
+        self.command_text.edit_modified(False)
+        actions = ttk.Frame(body)
+        actions.pack(fill=X, pady=8)
+        ttk.Button(actions, text="识别命令", command=self.recognize).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(actions, text="编辑识别结果", command=self.edit_result).pack(side=LEFT, padx=(0, 8))
+        for field in ("airline", "aircraft_type", "country_or_region"):
+            ttk.Button(actions, text=f"管理{FIELD_LABELS[field]}", command=lambda key=field: self.manage_options(key)).pack(side=LEFT, padx=(0, 8))
+        self.summary = StringVar(value="尚未识别")
+        ttk.Label(body, textvariable=self.summary, style="Warning.TLabel").pack(anchor="w", pady=(0, 6))
+        table_frame = ttk.Frame(body)
+        table_frame.pack(fill=BOTH, expand=True)
+        columns = ("line", "result", "airline", *DISPLAY_COLUMNS)
+        self.results = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        widths = {"line": 55, "result": 120, "airline": 130, "outbound_flight_no": 100, "return_flight_no": 100, "weekly_frequency": 60, "country_or_region": 120}
+        for column in columns:
+            self.results.heading(column, text={"line": "命令行", "result": "校验结果"}.get(column, DISPLAY_HEADINGS.get(column, column)))
+            self.results.column(column, width=widths.get(column, 80), minwidth=50, stretch=False)
+        yscroll = ttk.Scrollbar(table_frame, orient=VERTICAL, command=self.results.yview)
+        xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.results.xview)
+        self.results.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.results.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        self.results.tag_configure("error", foreground=palette["missing"])
+        self.results.tag_configure("warning", foreground=palette["pairing"])
+        self.results.tag_configure("ready", foreground=palette["complete"])
+        self.results.bind("<Double-1>", lambda _event: self.edit_result())
+        self.results.bind("<<TreeviewSelect>>", self.show_details)
+        detail_frame = ttk.Frame(body)
+        detail_frame.pack(fill=X, pady=(8, 8))
+        self.detail_text = tk.Text(detail_frame, height=4, wrap="word", background=palette["field"], foreground=palette["text"], font=("Segoe UI", 9), state="disabled")
+        self.detail_text.pack(side=LEFT, fill=X, expand=True)
+        detail_scroll = ttk.Scrollbar(detail_frame, orient=VERTICAL, command=self.detail_text.yview)
+        detail_scroll.pack(side=RIGHT, fill=Y)
+        self.detail_text.configure(yscrollcommand=detail_scroll.set)
+        bottom = ttk.Frame(body)
+        bottom.pack(fill=X)
+        self.warning_button = ttk.Button(bottom, text="确认时间占用提示", command=self.accept_conflicts, state="disabled")
+        self.warning_button.pack(side=LEFT)
+        self.confirm_button = ttk.Button(bottom, text="确认录入", command=self.confirm, state="disabled")
+        self.confirm_button.pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(bottom, text="关闭", command=self.destroy).pack(side=RIGHT)
+        self.command_text.focus_set()
+
+    def input_text(self) -> str:
+        return self.command_text.get("1.0", "end-1c")
+
+    def commands_changed(self, _event=None) -> None:
+        if not self.command_text.edit_modified():
+            return
+        self.command_text.edit_modified(False)
+        if hasattr(self, "confirm_button"):
+            self.confirm_button.configure(state="disabled")
+            self.warning_button.configure(state="disabled")
+            self.accepted_warnings.clear()
+            self.recognized_text = None
+            self.summary.set("命令已修改，请重新识别")
+
+    def recognize(self) -> None:
+        self.commands_changed()
+        self.app.options = load_reference_options(company_id=self.app.company["id"])
+        for field, token, suggested in missing_command_options(self.input_text(), self.app.options):
+            # A previous registration may have satisfied another line in this batch.
+            if (field, token, suggested) not in missing_command_options(self.input_text(), self.app.options):
+                continue
+            dialog = CommandReferenceDialog(self, self.app, field, token, suggested)
+            self.wait_window(dialog)
+            self.grab_set()
+        self.recognized_text = self.input_text()
+        self.drafts = recognize_commands(self.recognized_text, self.app.options)
+        self.accepted_warnings.clear()
+        self.revalidate()
+        messages = command_messages(self.errors)
+        if not self.drafts:
+            messagebox.showwarning("命令为空", "请先输入至少一条命令。", parent=self)
+        elif messages:
+            messagebox.showwarning("命令需要修正", "\n".join(messages[:12]) + ("\n更多问题请查看下方识别结果。" if len(messages) > 12 else ""), parent=self)
+        elif any(self.warnings.values()):
+            messagebox.showwarning("存在时间占用", "请检查识别结果中的时间占用信息，并选择修改结果或确认时间占用提示。", parent=self)
+
+    def revalidate(self) -> None:
+        current = load_data(company_id=self.app.company["id"])["records"]
+        self.app.options = load_reference_options(company_id=self.app.company["id"])
+        self.errors, self.warnings = validate_command_drafts(self.drafts, current, self.app.options)
+        selected = self.results.selection()
+        self.results.delete(*self.results.get_children())
+        for draft in self.drafts:
+            errors, warnings = self.errors[draft.line_number], self.warnings[draft.line_number]
+            state = "error" if errors else "warning" if warnings else "ready"
+            label = f"{len(errors)} 项错误" if errors else "时间占用" if warnings else "可录入"
+            values = (draft.line_number, label, draft.record.get("airline", ""), *(draft.record.get(column, "") for column in DISPLAY_COLUMNS))
+            self.results.insert("", END, iid=str(draft.line_number), values=values, tags=(state,))
+        if selected and self.results.exists(selected[0]):
+            self.results.selection_set(selected[0])
+        self.summary.set(f"识别 {len(self.drafts)} 条航线，{sum(bool(items) for items in self.errors.values())} 条有误，{sum(bool(items) for items in self.warnings.values())} 条有时间占用")
+        self.update_buttons()
+        self.show_details()
+
+    def update_buttons(self) -> None:
+        current = self.recognized_text is not None and self.input_text() == self.recognized_text and not self.saved
+        valid = current and bool(self.drafts) and not any(self.errors.values())
+        pending = set(command_messages(self.warnings)) - self.accepted_warnings
+        self.confirm_button.configure(state="normal" if valid and not pending else "disabled")
+        self.warning_button.configure(state="normal" if valid and pending else "disabled")
+
+    def show_details(self, _event=None) -> None:
+        selected = self.results.selection()
+        if selected:
+            number = int(selected[0])
+            messages = self.errors.get(number, []) + self.warnings.get(number, [])
+            detail = "\n".join(messages) or "该航线已通过校验。"
+        else:
+            detail = "\n".join(command_messages(self.errors) + command_messages(self.warnings))
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", END)
+        self.detail_text.insert("1.0", detail)
+        self.detail_text.configure(state="disabled")
+
+    def edit_result(self) -> None:
+        if self.recognized_text is None or self.input_text() != self.recognized_text:
+            messagebox.showinfo("请先识别", "请先识别当前命令，再编辑识别结果。", parent=self)
+            return
+        selected = self.results.selection()
+        if not selected:
+            messagebox.showinfo("请选择结果", "请先选择需要修正的航线。", parent=self)
+            return
+        draft = next(item for item in self.drafts if item.line_number == int(selected[0]))
+
+        def apply_edit(record):
+            draft.record = record
+            draft.parse_errors = []
+            self.accepted_warnings.clear()
+            self.revalidate()
+
+        editor = FlightEditor(self.app, draft.record, on_save=apply_edit, parent=self)
+        self.wait_window(editor)
+        if self.winfo_exists():
+            self.grab_set()
+
+    def manage_options(self, field: str) -> None:
+        dialog = OptionManagerDialog(self.app, field)
+        self.wait_window(dialog)
+        self.grab_set()
+        self.accepted_warnings.clear()
+        if self.recognized_text is not None:
+            self.revalidate()
+
+    def accept_conflicts(self) -> None:
+        self.revalidate()
+        messages = command_messages(self.warnings)
+        if any(self.errors.values()) or not messages:
+            return
+        if messagebox.askyesno("确认时间占用", "\n".join(messages[:15]) + ("\n其余时间占用信息见预览明细。" if len(messages) > 15 else "") + "\n\n已检查全部时间占用，仍继续录入？", default=messagebox.NO, parent=self):
+            self.accepted_warnings = set(messages)
+            self.update_buttons()
+
+    def confirm(self) -> None:
+        if self.saved or self.recognized_text is None or self.input_text() != self.recognized_text:
+            return
+        self.revalidate()
+        if any(self.errors.values()) or not self.drafts or set(command_messages(self.warnings)) - self.accepted_warnings:
+            messagebox.showwarning("暂不可录入", "请修正全部错误并确认时间占用提示后再录入。", parent=self)
+            return
+        self.confirm_button.configure(state="disabled")
+        try:
+            count = commit_command_drafts(self.drafts, self.app.company["id"], accepted_warnings=self.accepted_warnings)
+        except (ValueError, OSError, sqlite3.Error, DatabaseStartupError) as exc:
+            messagebox.showerror("录入未完成", str(exc), parent=self)
+            self.revalidate()
+            return
+        self.saved = True
+        self.app.reload_from_database()
+        messagebox.showinfo("录入完成", f"已录入 {count} 条往返航线。", parent=self)
         self.destroy()
 
 
@@ -2156,12 +2654,12 @@ class PairDialog(Toplevel):
         for record in self.app.records:
             if record.get("id") == self.source.get("id"):
                 continue
-            if self.same_airport_only and record.get("airport_code") != self.source.get("airport_code"):
+            if self.same_airport_only and not airports_compatible(self.source, record):
                 continue
             summary = record_summary(record)
             searchable = " ".join(
                 str(record.get(field, ""))
-                for field in ("outbound_flight_no", "return_flight_no", "airport_code", "departure_time", "arrival_time")
+                for field in ("outbound_flight_no", "return_flight_no", "departure_airport_code", "airport_code", "departure_time", "arrival_time")
             ).upper()
             if term and term not in searchable and term not in summary.upper():
                 continue
@@ -2438,6 +2936,7 @@ class FlightManagerApp:
         self.current_display_groups: list[list[dict[str, str]]] = []
         self.search_vars = {
             "flight_no": StringVar(),
+            "departure_airport_code": StringVar(),
             "airport_code": StringVar(),
             "airline": StringVar(),
             "aircraft_type": StringVar(),
@@ -2489,11 +2988,14 @@ class FlightManagerApp:
         search_buttons.grid(row=3, column=0, sticky="w", pady=(8, 0))
         utility_buttons = ttk.Frame(search_frame)
         utility_buttons.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        management_buttons = ttk.Frame(search_frame)
+        management_buttons.grid(row=5, column=0, sticky="w", pady=(8, 0))
         search_frame.columnconfigure(0, weight=1)
 
         for key, label_text, width in (
             ("flight_no", "航班号", 14),
-            ("airport_code", "机场代码", 10),
+            ("departure_airport_code", "出发机场", 10),
+            ("airport_code", "到达机场", 10),
         ):
             ttk.Label(search_inputs, text=label_text).pack(side=LEFT, padx=(0, 6))
             entry = ttk.Entry(search_inputs, textvariable=self.search_vars[key], width=width)
@@ -2519,6 +3021,7 @@ class FlightManagerApp:
             ("查询", self.apply_search),
             ("清空", self.clear_search),
             ("新增航线", self.add_record),
+            ("使用命令录入", self.open_command_entry),
             ("编辑选中", self.edit_selected),
             ("关联选中", self.pair_selected),
             ("取消关联", self.clear_selected_pair),
@@ -2531,20 +3034,20 @@ class FlightManagerApp:
             ("恢复备份", self.restore_database_backup),
             ("导出 Excel/CSV", self.export_visible_data),
             ("从 JSON 导入旧数据", self.import_legacy_json),
-            ("管理子公司", lambda: self.open_option_manager("airline")),
-            ("管理机型", lambda: self.open_option_manager("aircraft_type")),
             ("退出当前登录", self.logout),
             ("关于", self.show_about),
         ):
             ttk.Button(utility_buttons, text=text, command=command).pack(side=LEFT, padx=(0, 6))
-        ttk.Separator(utility_buttons, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=(4, 10))
-        self.theme_button = ttk.Button(utility_buttons, text="", command=self.toggle_theme)
+        for field in ("airline", "aircraft_type", "country_or_region"):
+            ttk.Button(management_buttons, text=f"管理{FIELD_LABELS[field]}", command=lambda item=field: self.open_option_manager(item)).pack(side=LEFT, padx=(0, 6))
+        ttk.Separator(management_buttons, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=(4, 10))
+        self.theme_button = ttk.Button(management_buttons, text="", command=self.toggle_theme)
         self.theme_button.pack(side=LEFT, padx=(0, 6))
-        ttk.Label(utility_buttons, text="表格缩放").pack(side=LEFT, padx=(4, 6))
-        ttk.Button(utility_buttons, text="−", width=3, command=self.zoom_out).pack(side=LEFT, padx=(0, 2))
-        ttk.Label(utility_buttons, textvariable=self.zoom_text, width=5, anchor="center").pack(side=LEFT, padx=(2, 2))
-        ttk.Button(utility_buttons, text="+", width=3, command=self.zoom_in).pack(side=LEFT, padx=(2, 2))
-        ttk.Button(utility_buttons, text="重置", command=self.reset_zoom).pack(side=LEFT, padx=(4, 0))
+        ttk.Label(management_buttons, text="表格缩放").pack(side=LEFT, padx=(4, 6))
+        ttk.Button(management_buttons, text="−", width=3, command=self.zoom_out).pack(side=LEFT, padx=(0, 2))
+        ttk.Label(management_buttons, textvariable=self.zoom_text, width=5, anchor="center").pack(side=LEFT, padx=(2, 2))
+        ttk.Button(management_buttons, text="+", width=3, command=self.zoom_in).pack(side=LEFT, padx=(2, 2))
+        ttk.Button(management_buttons, text="重置", command=self.reset_zoom).pack(side=LEFT, padx=(4, 0))
 
         self.content = ttk.PanedWindow(root_frame, orient="horizontal")
         self.content.pack(fill=BOTH, expand=True, pady=(12, 8))
@@ -2563,9 +3066,13 @@ class FlightManagerApp:
             self.table.column(column, width=DEFAULT_COLUMN_WIDTHS[column], anchor="center", stretch=column in {"airline", "country_or_region"})
 
         yscroll = ttk.Scrollbar(table_frame, orient=VERTICAL, command=self.table.yview)
-        self.table.configure(yscrollcommand=yscroll.set)
-        self.table.pack(side=LEFT, fill=BOTH, expand=True)
-        yscroll.pack(side=RIGHT, fill=Y)
+        xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
+        self.table.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.table.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
         self.table.bind("<Double-1>", lambda _event: self.edit_selected())
         self.table.bind("<Button-3>", self.show_column_menu)
         self.table.bind("<Control-Button-1>", self.show_column_menu)
@@ -2774,10 +3281,9 @@ class FlightManagerApp:
         if combo is None:
             return
         combo.configure(
-            values=filter_options(
+            values=dropdown_options(
                 self.option_values_for_field(field),
                 combo.get(),
-                limit=500,
             )
         )
 
@@ -3007,18 +3513,7 @@ class FlightManagerApp:
                 self.record_to_row_id[record["id"]] = row_id
             missing = any(missing_fields(record) for record in group)
             pairing = any(needs_pairing(record) for record in group)
-            values = (
-                group_display_value(group, "status"),
-                group_display_value(group, "outbound_flight_no"),
-                group_display_value(group, "return_flight_no"),
-                group_display_value(group, "airport_code"),
-                group_display_value(group, "departure_time"),
-                group_display_value(group, "arrival_time"),
-                group_display_value(group, "aircraft_type"),
-                group_display_value(group, "airline"),
-                group_display_value(group, "country_or_region"),
-                group_display_value(group, "route_pair_id"),
-            )
+            values = tuple(group_display_value(group, column) for column in DISPLAY_COLUMNS)
             state = "missing" if missing else "pairing" if pairing else "complete"
             parity = "even" if index % 2 == 0 else "odd"
             tag = f"{state}_{parity}"
@@ -3070,6 +3565,9 @@ class FlightManagerApp:
     def add_record(self) -> None:
         FlightEditor(self)
 
+    def open_command_entry(self) -> None:
+        CommandEntryDialog(self)
+
     def edit_selected(self) -> None:
         record = self.selected_record()
         if record:
@@ -3093,7 +3591,7 @@ class FlightManagerApp:
             messagebox.showwarning("请先补录", "该航线仍有必填信息未录入，请补录完整后再关联去程或返程航班。", parent=self.root)
             FlightEditor(self, record, focus_field=missing_fields(record)[0])
             return
-        PairDialog(self, record, notice="请从机场代码相同的现有航班中选择对应的去程或返程航班。")
+        PairDialog(self, record, notice="请选择到达机场相同、出发机场兼容的现有去程或返程航班。")
 
     def try_auto_pair_existing(self, record_id: str, original_record: dict[str, str]) -> None:
         record = next((item for item in self.records if item.get("id") == record_id), None)
@@ -3104,14 +3602,14 @@ class FlightManagerApp:
             self.associate_records(record_id, candidates[0]["id"], show_message=False)
             messagebox.showinfo(
                 "已自动关联",
-                "已根据机场代码和补录的对应去程离港/返程抵港时间，将该航班与现有单程记录关联，并同步补齐对方空白字段。",
+                "已根据出发/到达机场和补录的对应去程离港/返程抵港时间关联现有单程记录，并同步补齐对方空白字段。",
                 parent=self.root,
             )
             return
         if len(candidates) > 1:
             notice = "找到多个同机场、同对应时间的候选航班，请手动选择要关联的去程或返程航班。"
         else:
-            notice = "未找到唯一的自动匹配项。请从机场代码相同的现有航班中手动选择对应的去程或返程航班。"
+            notice = "未找到唯一的自动匹配项。请从到达机场相同、出发机场兼容的现有航班中手动选择对应航班。"
         PairDialog(self, record, notice=notice)
 
     def get_counterparts(self, record: dict[str, str]) -> list[dict[str, str]]:
@@ -3154,8 +3652,8 @@ class FlightManagerApp:
         if not source or not target:
             messagebox.showerror("关联失败", "未找到需要关联的航线记录。", parent=parent or self.root)
             return False
-        if source.get("airport_code") != target.get("airport_code"):
-            messagebox.showerror("关联失败", "仅允许关联机场代码相同的去程/返程航班。", parent=parent or self.root)
+        if not airports_compatible(source, target):
+            messagebox.showerror("关联失败", "到达机场必须相同；双方已填写的出发机场也必须相同。", parent=parent or self.root)
             return False
         source_pair = source.get("route_pair_id", "")
         target_pair = target.get("route_pair_id", "")
